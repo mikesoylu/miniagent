@@ -1,6 +1,6 @@
 A single Bash script agent harness with minimal dependencies. Built for GitHub Actions, CI/CD pipelines, remote SSH sessions, and similar headless environments. It works with OpenAI, Anthropic, and OpenRouter.
 
-The complete script, including its embedded Bash/awk JSON fallback, is **25.54 KiB gzipped** (26,153 bytes), measured with `gzip -n -c miniagent.sh | wc -c` using default compression.
+The complete script, including its embedded Bash/awk JSON fallback, is **25.64 KiB gzipped** (26,259 bytes), measured with `gzip -n -c miniagent.sh | wc -c` using default compression.
 
 Run an agent loop directly without installing:
 
@@ -23,7 +23,7 @@ curl -fsSL https://miniagent.sh | bash
 - Supports configurable reasoning effort, model-call and output limits, command timeouts, and machine-readable JSON output.
 - Automatically compacts long conversations using exact provider-reported token usage while preserving the latest complete turn.
 - Can retry recognized safety refusals once with a configured fallback model and keep that model selected for the session.
-- Keeps tool progress on stderr so normal and JSON answers on stdout are easy to pipe.
+- Keeps tool progress on stderr so normal and JSON answers on stdout are easy to pipe. Model, reasoning, context usage, and turn count print once when a request finishes or is cancelled, rather than before every model call.
 
 ## Requirements
 

@@ -1523,9 +1523,9 @@ agent_turn_openai() {
   LAST_ANSWER=""
   turn=1
   while [[ "$turn" -le "$MAX_TURNS" ]]; do
+    generation_turn=$turn
     debug_log "model_turn_start provider=openai model=${TURN_MODEL:-$MODEL} turn=$turn context=$(context_usage) previous_response_id=${OPENAI_PREVIOUS_RESPONSE_ID:-none} needs_restart=$OPENAI_NEEDS_RESTART"
     debug_state model-turn-openai
-    info "model ${TURN_MODEL:-$MODEL} · openai responses · reasoning $REASONING · context $(context_usage) · turn $turn/$MAX_TURNS"
     if [[ "$OPENAI_NEEDS_RESTART" -eq 1 ]]; then input=$(openai_history_input); OPENAI_NEEDS_RESTART=0; fi
     debug_dump model-input-openai.json "$input"
     debug_dump history-model-turn-openai.json "$HISTORY"
@@ -1569,6 +1569,17 @@ agent_turn_openai() {
 }
 
 agent_turn() {
+  # Dynamic scope lets either provider loop record its final attempted turn.
+  local generation_turn=0 status=0 provider_label=$PROVIDER
+  agent_turn_run "$@" || status=$?
+  if [[ "$generation_turn" -gt 0 ]]; then
+    [[ "$PROVIDER" != "openai" ]] || provider_label="openai responses"
+    info "model ${TURN_MODEL:-$MODEL} · $provider_label · reasoning $REASONING · context $(context_usage) · turn $generation_turn/$MAX_TURNS"
+  fi
+  return "$status"
+}
+
+agent_turn_run() {
   local user_text=$1 turn text call_count user_message assistant_content
   [[ -n "$TURN_MODEL" ]] || TURN_MODEL=$MODEL
   if [[ "$PROVIDER" == "openai" ]]; then agent_turn_openai "$user_text"; return; fi
@@ -1577,9 +1588,9 @@ agent_turn() {
   LAST_ANSWER=""
   turn=1
   while [[ "$turn" -le "$MAX_TURNS" ]]; do
+    generation_turn=$turn
     debug_log "model_turn_start provider=$PROVIDER model=${TURN_MODEL:-$MODEL} turn=$turn context=$(context_usage)"
     debug_state "model-turn-$PROVIDER"
-    info "model ${TURN_MODEL:-$MODEL} · $PROVIDER · reasoning $REASONING · context $(context_usage) · turn $turn/$MAX_TURNS"
     debug_dump "history-model-turn-$PROVIDER.json" "$HISTORY"
     if [[ "$PROVIDER" == "anthropic" ]]; then
       call_with_fallback call_anthropic || return 1

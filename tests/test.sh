@@ -155,9 +155,16 @@ if [[ $(uname -s) == Darwin ]]; then assert_contains "$(jq -r '.instructions' "$
 assert_contains "$(jq -r '.input[] | select(.type == "shell_call_output") | .output[0].stdout' "$TMP/openai.json")" "hello from fixture" "OpenAI shell output continuation"
 assert_equal "$(jq -r '.model' "$TMP/openai.json")" "gpt-5.6-sol" "OpenAI default model"
 
-progress=$(OPENAI_API_KEY=test CURL_BIN="$TMP/curl" "$ROOT/miniagent.sh" -m gpt-5.6-sol -C "$TMP" "inspect" 2>&1 >/dev/null)
-assert_contains "$progress" "context unknown/262144 · turn 1/1024" "Progress shows unknown context before initial usage"
-assert_contains "$progress" "context 50/262144 · turn 2/1024" "Progress shows latest provider context usage"
+for provider in openai anthropic openrouter; do
+  progress=$(OPENAI_API_KEY=test ANTHROPIC_API_KEY=test OPENROUTER_API_KEY=test CURL_BIN="$TMP/curl" "$ROOT/miniagent.sh" -p "$provider" -C "$TMP" "inspect" 2>&1 >/dev/null)
+  assert_equal "$(printf '%s\n' "$progress" | grep -c '^model ')" "1" "$provider prints one generation summary"
+  assert_contains "$progress" "context 100/262144 · turn 2/1024" "$provider summary shows final turn and latest usage"
+  assert_not_contains "$progress" "turn 1/1024" "$provider hides intermediate generation summaries"
+done
+progress=$(OPENAI_API_KEY=test CURL_BIN="$TMP/curl" "$ROOT/miniagent.sh" -q -C "$TMP" "inspect" 2>&1 >/dev/null)
+assert_equal "$progress" "" "Quiet mode hides the final generation summary"
+progress=$(OPENAI_API_KEY=test MINIAGENT_MAX_TURNS=1 CURL_BIN="$TMP/curl" "$ROOT/miniagent.sh" -C "$TMP" "inspect" 2>&1 >/dev/null)
+assert_contains "$progress" "turn 1/1" "Turn-limit summary reports the last attempted turn"
 
 out=$(ANTHROPIC_API_KEY=test MOCK_CAPTURE="$TMP/anthropic.json" CURL_BIN="$TMP/curl" "$ROOT/miniagent.sh" -q -p anthropic -C "$TMP" "inspect")
 assert_contains "$out" "anthropic done" "Anthropic tool loop"
@@ -300,7 +307,6 @@ set tmp $env(EXPECT_TMP)
 spawn env OPENAI_API_KEY=test MOCK_DELAY=1 MOCK_CAPTURE=$tmp/queued-interactive.json CURL_BIN=$tmp/curl $root/miniagent.sh -C $tmp
 expect "> "
 send -- "inspect\r"
-expect "model "
 expect "(queue) "
 send -- "queued follow-up\r"
 expect "queued message"
@@ -330,6 +336,7 @@ EXPECT_MULTILINE
   EXPECT_ROOT="$ROOT" EXPECT_TMP="$TMP" expect <<'EXPECT_EOF'
 set timeout 15
 log_user 0
+log_file -a $env(EXPECT_TMP)/ctrl-d-api.log
 set root $env(EXPECT_ROOT)
 set tmp $env(EXPECT_TMP)
 spawn env OPENAI_API_KEY=test MOCK_DELAY=10 CURL_BIN=$tmp/curl $root/miniagent.sh --debug-dir $tmp/ctrl-d-api-debug -C $tmp
@@ -337,7 +344,6 @@ expect "> "
 send -- "\004"
 expect "> "
 send -- "inspect\r"
-expect "model "
 expect "(queue) "
 send -- "\004"
 expect "stop requested"
@@ -349,12 +355,15 @@ expect "> "
 send -- "/quit\r"
 expect eof
 EXPECT_EOF
+  assert_equal "$(grep -c ' · openai responses ·' "$TMP/ctrl-d-api.log")" "1" "API cancellation prints one generation summary"
+  assert_contains "$(cat "$TMP/ctrl-d-api.log")" "context unknown/262144 · turn 1/1024" "API cancellation reports the attempted turn"
   assert_equal "$(find "$TMP/ctrl-d-api-debug" -name 'api-request.json.*' | wc -l | tr -d ' ')" "1" "Ctrl-D aborts an in-flight API request without a continuation"
   assert_equal "$(find "$TMP/ctrl-d-api-debug" -name 'api-response.json.*' | wc -l | tr -d ' ')" "0" "Aborted API response is discarded"
 
   EXPECT_ROOT="$ROOT" EXPECT_TMP="$TMP" expect <<'EXPECT_TOOL_ABORT'
 set timeout 15
 log_user 0
+log_file -a $env(EXPECT_TMP)/ctrl-d-tool.log
 set root $env(EXPECT_ROOT)
 set tmp $env(EXPECT_TMP)
 spawn env OPENAI_API_KEY=test MOCK_ABORT_TOOL=1 MOCK_KIND_TRACE=$tmp/ctrl-d-tool-kinds.trace CURL_BIN=$tmp/curl $root/miniagent.sh --debug-dir $tmp/ctrl-d-tool-debug -C $tmp
@@ -371,6 +380,8 @@ expect "> "
 send -- "/quit\r"
 expect eof
 EXPECT_TOOL_ABORT
+  assert_equal "$(grep -c ' · openai responses ·' "$TMP/ctrl-d-tool.log")" "1" "Tool cancellation prints one generation summary"
+  assert_contains "$(cat "$TMP/ctrl-d-tool.log")" "context 50/262144 · turn 1/1024" "Tool cancellation reports usage before history rollback"
   assert_equal "$(find "$TMP/ctrl-d-tool-debug" -name 'api-request.json.*' | wc -l | tr -d ' ')" "1" "Ctrl-D aborts an in-flight tool without a continuation"
   assert_equal "$(paste -sd, "$TMP/ctrl-d-tool-kinds.trace")" "normal" "Tool abort does not submit a tool result"
 fi
