@@ -525,6 +525,30 @@ assert_contains "$(printf '%s' "$HISTORY" | jq -r '.[0].content')" "checkpoint s
 assert_equal "$CONTEXT_TOKENS" "0" "Compaction resets context usage"
 assert_equal "$CONTEXT_TOKENS_KNOWN" "0" "Compaction marks context usage unknown until the next response"
 
+# Never send an empty or malformed request when JSON construction fails.
+for provider in openrouter openai anthropic; do
+  for history in '' '{'; do
+    (
+      api_request() { printf called > "$TMP/invalid-$provider.sent"; }
+      HISTORY=$history
+      case "$provider" in
+        openrouter) call_openrouter disabled ;;
+        openai) call_openai_responses "$history" disabled ;;
+        anthropic) call_anthropic disabled ;;
+      esac
+    ) > /dev/null 2>&1
+    status=$?
+    if [[ "$status" -ne 0 && ! -e "$TMP/invalid-$provider.sent" ]]; then
+      ok "$provider rejects invalid or empty request input before HTTP"
+    else
+      not_ok "$provider rejects invalid or empty request input before HTTP"
+    fi
+  done
+done
+LAST_ANSWER=$'answer\n\n'; OUTPUT_FORMAT=json
+print_answer > "$TMP/answer.json"
+assert_equal "$(jq -r '.answer | length' "$TMP/answer.json")" "8" "JSON answer preserves trailing newlines"
+
 if bash -n "$ROOT/miniagent.sh"; then ok "Bash syntax"; else not_ok "Bash syntax"; fi
 if bash -n "$ROOT/install.sh"; then ok "Installer syntax"; else not_ok "Installer syntax"; fi
 

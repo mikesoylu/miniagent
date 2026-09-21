@@ -1,6 +1,6 @@
 A single Bash script agent harness with minimal dependencies. Built for GitHub Actions, CI/CD pipelines, remote SSH sessions, and similar headless environments. It works with OpenAI, Anthropic, and OpenRouter.
 
-The complete script, including its embedded Bash/awk JSON fallback, is **25.33 KiB gzipped** (25,934 bytes), measured with `gzip -n -c miniagent.sh | wc -c` using default compression.
+The complete script, including its embedded Bash/awk JSON fallback, is **25.41 KiB gzipped** (26,016 bytes), measured with `gzip -n -c miniagent.sh | wc -c` using default compression.
 
 Run an agent loop directly without installing:
 
@@ -151,7 +151,7 @@ The default base URLs are the providers' public APIs. `ANTHROPIC_VERSION` defaul
 
 `CURL_BIN` and `JQ_BIN` may also be set to alternate executable paths, primarily for testing. A custom `JQ_BIN` path must exist; it is not replaced automatically. Set `JQ_BIN=miniagent_jq` to force the embedded fallback even when jq is installed.
 
-The fallback implements the jq filters used by this harness, not the full jq language. It requires awk with regex record separators (as provided by current macOS awk, GNU awk, mawk, and BusyBox awk), uses double-precision arithmetic, and does not support NUL characters. Native jq remains preferred for performance.
+The fallback implements the jq filters used by this harness, not the full jq language. It requires awk with regex record separators (as provided by current macOS awk, GNU awk, mawk, and BusyBox awk), uses double-precision arithmetic, and does not support NUL characters. Native jq remains preferred for performance. JSON processing uses pipes and regular temporary files, so `/dev/fd` and Bash process substitution are not required (including in minimal Linux and JSLinux environments).
 
 ## Provider tools and file support
 
@@ -203,4 +203,13 @@ To test the fallback with Alpine’s BusyBox awk (jq is installed only for the t
 ```bash
 docker run --rm -v "$PWD:/work:ro" -w /work alpine sh -c \
   'apk add --no-cache bash curl jq && bash tests/test-json.sh && JQ_BIN=miniagent_jq bash tests/test.sh'
+```
+
+To cover environments without `/dev/fd` or `/dev/stdin`, run both backends in a disposable container:
+
+```bash
+docker run --rm -v "$PWD:/work:ro" -w /work alpine sh -c '
+  apk add --no-cache bash curl jq &&
+  mv /dev/fd /dev/fd.saved && mv /dev/stdin /dev/stdin.saved &&
+  bash tests/test-json.sh && bash tests/test.sh && JQ_BIN=miniagent_jq bash tests/test.sh'
 ```

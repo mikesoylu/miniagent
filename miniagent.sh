@@ -234,13 +234,23 @@ miniagent_jq() {
     if [[ ${#arg} -ge 65536 ]]; then
       # Linux limits individual exec arguments to ~128 KiB. Large histories and
       # image attachments can exceed that, so pass a length-prefixed argument
-      # stream through a descriptor. Byte lengths are measured in the C locale.
-      miniq_awk --miniq-args-file <(for arg in "$@"; do printf '%s\n%s' "${#arg}" "$arg"; done)
+      # stream through a private file. Byte lengths use the C locale.
+      miniq_large_args "$@"
       return $?
     fi
   done
   miniq_awk "$@"
 }
+miniq_large_args() (
+  # A subshell keeps cleanup traps local and leaves stdin available to awk.
+  local args_file arg
+  args_file=$(mktemp "${TMPDIR:-/tmp}/miniagent-json.XXXXXX") || return 1
+  trap 'rm -f "$args_file"' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  for arg in "$@"; do printf '%s\n%s' "${#arg}" "$arg"; done > "$args_file" || return 1
+  miniq_awk --miniq-args-file "$args_file"
+)
 miniq_awk() {
   awk -- '
 # Minimal jq evaluator for the filters in miniagent.sh. MIT license.
@@ -504,7 +514,7 @@ function call(n,input,e, name,r,args,a,b,i,j,s,sep,tmp,x,pat,flags) {
 }
 # An anchored empty-record regex reads a whole nonempty file, preserving newlines.
 # Do not close /dev/stdin: mawk aliases it to its own standard input stream.
-function readexact(path, s,line,status,old) {old=RS;RS="^$";s="";while((status=(getline line < path))>0){if(length(s))die("NUL bytes in raw input are unsupported");s=line}if(status<0)die("cannot read " path);if(path!="/dev/stdin")close(path);RS=old;return s}
+function readexact(path, stdin, s,line,status,old) {old=RS;RS="^$";s="";while((status=(stdin?(getline line):(getline line < path)))>0){if(length(s))die("NUL bytes in raw input are unsupported");s=line}if(status<0)die("cannot read " path);if(!stdin&&path!="/dev/stdin")close(path);RS=old;return s}
 BEGIN {
   EC=2
   for(ai=1;ai<32;ai++)Escape[sprintf("%c",ai)]=sprintf("\\u%04x",ai)
@@ -534,6 +544,8 @@ BEGIN {
     }
     if(!havefilter){filter=arg;havefilter=1}else Files[++NFIL]=arg
   }
+  # Bare getline must read stdin, not the jq options in awk ARGV.
+  for(ai=1;ai<ARGC;ai++)delete ARGV[ai];ARGC=1
   if(!havefilter)filter="."
   EC=3;lex(filter);AST=expr(1);need("EOF")
   EC=5;Inputs=arr()
@@ -542,7 +554,7 @@ BEGIN {
     if(!NFIL)Files[++NFIL]="-"
     rawbuf=""
     for(fi=1;fi<=NFIL;fi++){
-      data=readexact(Files[fi]=="-"?"/dev/stdin":Files[fi])
+      data=readexact(Files[fi],Files[fi]=="-")
       if(rawin){if(slurp)rawbuf=rawbuf data;else{while(index(data,"\n")){idx=index(data,"\n");push(Inputs,value("string",substr(data,1,idx-1)));data=substr(data,idx+1)}if(length(data))push(Inputs,value("string",data))}}
       else append(Inputs,parsejson(data,1))
     }
@@ -963,10 +975,10 @@ call_openrouter() {
     [[ "$effort" == "max" ]] && effort="xhigh"
     reason_args=$("$JQ_BIN" -cn --arg e "$effort" '{reasoning:{effort:$e}}')
   fi
-  body=$("$JQ_BIN" -cn --arg model "${TURN_MODEL:-$MODEL}" --arg system "$(system_prompt)" \
-    --slurpfile history <(printf '%s\n' "$HISTORY") --argjson tool_args "$tool_args" --argjson extra "$reason_args" \
+  body=$(printf '%s\n' "$HISTORY" | "$JQ_BIN" -ce --arg model "${TURN_MODEL:-$MODEL}" --arg system "$(system_prompt)" \
+    --argjson tool_args "$tool_args" --argjson extra "$reason_args" \
     --argjson max "$MAX_TOKENS" \
-    '({model:$model,messages:([{role:"system",content:$system}] + $history[0]),max_completion_tokens:$max} + $tool_args + $extra)')
+    '({model:$model,messages:([{role:"system",content:$system}] + .),max_completion_tokens:$max} + $tool_args + $extra)') || return 1
   key=$OPENROUTER_API_KEY; url="$API_URL$OPENROUTER_COMPLETIONS_PATH"
   [[ -n "${OPENROUTER_HTTP_REFERER:-}" ]] && extra_headers+=( -H "HTTP-Referer: $OPENROUTER_HTTP_REFERER" )
   [[ -n "${OPENROUTER_APP_NAME:-}" ]] && extra_headers+=( -H "X-Title: $OPENROUTER_APP_NAME" )
@@ -991,10 +1003,10 @@ call_openai_responses() {
   if [[ -n "$OPENAI_PREVIOUS_RESPONSE_ID" ]]; then
     previous_args=$("$JQ_BIN" -cn --arg id "$OPENAI_PREVIOUS_RESPONSE_ID" '{previous_response_id:$id}')
   fi
-  body=$("$JQ_BIN" -cn --arg model "${TURN_MODEL:-$MODEL}" --arg instructions "$(system_prompt)" \
-    --slurpfile input <(printf '%s\n' "$input") --argjson reason "$reason_args" \
+  body=$(printf '%s\n' "$input" | "$JQ_BIN" -ce --arg model "${TURN_MODEL:-$MODEL}" --arg instructions "$(system_prompt)" \
+    --argjson reason "$reason_args" \
     --argjson previous "$previous_args" --argjson tool_args "$tool_args" --argjson max "$MAX_TOKENS" \
-    '({model:$model,instructions:$instructions,input:$input[0],max_output_tokens:$max} + $tool_args + $reason + $previous)')
+    '({model:$model,instructions:$instructions,input:.,max_output_tokens:$max} + $tool_args + $reason + $previous)') || return 1
   api_request "$API_URL/responses" "authorization" "Bearer $OPENAI_API_KEY" "$body" || return 1
   if printf '%s' "$API_RESPONSE" | "$JQ_BIN" -e '.error != null or .status == "failed"' >/dev/null 2>&1; then
     printf 'API error: %s\n' "$(printf '%s' "$API_RESPONSE" | "$JQ_BIN" -r '.error.message // .error // "response failed"')" >&2
@@ -1018,10 +1030,10 @@ call_anthropic() {
       thinking=$("$JQ_BIN" -cn --arg e "$effort" '{thinking:{type:"adaptive"},output_config:{effort:$e}}')
       ;;
   esac
-  body=$("$JQ_BIN" -cn --arg model "${TURN_MODEL:-$MODEL}" --arg system "$(system_prompt)" \
-    --slurpfile history <(printf '%s\n' "$HISTORY") --argjson tool_args "$tool_args" --argjson extra "$thinking" \
+  body=$(printf '%s\n' "$HISTORY" | "$JQ_BIN" -ce --arg model "${TURN_MODEL:-$MODEL}" --arg system "$(system_prompt)" \
+    --argjson tool_args "$tool_args" --argjson extra "$thinking" \
     --argjson max "$MAX_TOKENS" \
-    '({model:$model,system:$system,messages:$history[0],max_tokens:$max} + $tool_args + $extra)')
+    '({model:$model,system:$system,messages:.,max_tokens:$max} + $tool_args + $extra)') || return 1
   api_request "$API_URL/messages" "x-api-key" "$ANTHROPIC_API_KEY" "$body" \
     -H "anthropic-version: ${ANTHROPIC_VERSION:-2023-06-01}" || return 1
   if printf '%s' "$API_RESPONSE" | "$JQ_BIN" -e '.type == "error"' >/dev/null 2>&1; then
@@ -1208,7 +1220,7 @@ maybe_compact() {
   compact_history "$pending" "$resume"
 }
 auto_compact() {
-  if ! maybe_compact "${1:-'[]'}" "${2:-0}"; then
+  if ! maybe_compact "${1:-[]}" "${2:-0}"; then
     info "${C_CYAN}compact${C_RESET} failed; continuing with the current context"
     debug_log "automatic_compaction_failed action=continue_current_context previous_response_id=${OPENAI_PREVIOUS_RESPONSE_ID:-none}"
   fi
@@ -1232,8 +1244,8 @@ openai_history_input() {
 
 openai_input_with_queued_messages() {
   local pending=$1
-  "$JQ_BIN" -cn --argjson pending "$pending" --argjson queued "$INTERACTIVE_QUEUED_BATCH" \
-    '$pending + [$queued[] | {role:"user",content:[{type:"input_text",text:.}]}]'
+  printf '%s\n' "$pending" | "$JQ_BIN" -c --argjson queued "$INTERACTIVE_QUEUED_BATCH" \
+    '. + [$queued[] | {role:"user",content:[{type:"input_text",text:.}]}]'
 }
 
 record_openai_response() {
@@ -1263,8 +1275,8 @@ b64_file() { base64 < "$1" | tr -d '\r\n'; }
 
 image_result() {
   local path=$1 text=$2 mime=$3
-  "$JQ_BIN" -Rsc --arg text "$text" --arg mime "$mime" \
-    '{kind:"image",text:$text,media_type:$mime,data:.}' < <(b64_file "$path")
+  b64_file "$path" | "$JQ_BIN" -Rsc --arg text "$text" --arg mime "$mime" \
+    '{kind:"image",text:$text,media_type:$mime,data:.}'
 }
 
 number_lines() {
@@ -1393,13 +1405,12 @@ process_openai_tool_calls() {
       result_text=$(printf '%s' "$result" | "$JQ_BIN" -r '.text')
       tool_output=$("$JQ_BIN" -cn --arg id "$call_id" --arg output "$result_text" \
         '{type:"function_call_output",call_id:$id,output:$output}')
-      next=$("$JQ_BIN" -cs '.[0] + [.[1]]' <(printf '%s\n' "$next") <(printf '%s\n' "$tool_output"))
+      next=$(printf '%s\n%s\n' "$next" "$tool_output" | "$JQ_BIN" -cs '.[0] + [.[1]]')
       record_openai_tool_result "$name" "$result_text"
       if [[ $(printf '%s' "$result" | "$JQ_BIN" -r '.kind') == "image" ]]; then
         attachment=$(printf '%s' "$result" | "$JQ_BIN" -c \
           '{type:"input_image",image_url:("data:"+.media_type+";base64,"+.data)}')
-        attachments=$("$JQ_BIN" -cs '.[0] + [.[1]]' \
-          <(printf '%s\n' "$attachments") <(printf '%s\n' "$attachment"))
+        attachments=$(printf '%s\n%s\n' "$attachments" "$attachment" | "$JQ_BIN" -cs '.[0] + [.[1]]')
       fi
       continue
     fi
@@ -1412,21 +1423,17 @@ process_openai_tool_calls() {
       [[ -n "$command_text" ]] || continue
       status=0; capture_result run_native_command "$command_text" "$requested_limit" "$timeout_seconds" || status=$?; result=$CAPTURED_RESULT
       [[ "$status" -eq 0 ]] || return "$status"
-      outputs=$("$JQ_BIN" -cs '.[0] + [.[1]]' \
-        <(printf '%s\n' "$outputs") <(printf '%s\n' "$result"))
-    done < <(printf '%s' "$call" | "$JQ_BIN" -c '.action.commands[]')
-    tool_output=$("$JQ_BIN" -cn --arg id "$call_id" --argjson max "$requested_limit" \
-      --slurpfile outputs <(printf '%s\n' "$outputs") \
-      '{type:"shell_call_output",call_id:$id,max_output_length:$max,output:$outputs[0]}')
-    next=$("$JQ_BIN" -cs '.[0] + [.[1]]' \
-      <(printf '%s\n' "$next") <(printf '%s\n' "$tool_output"))
+      outputs=$(printf '%s\n%s\n' "$outputs" "$result" | "$JQ_BIN" -cs '.[0] + [.[1]]')
+    done <<< "$(printf '%s' "$call" | "$JQ_BIN" -c '.action.commands[]')"
+    tool_output=$(printf '%s\n' "$outputs" | "$JQ_BIN" -c --arg id "$call_id" --argjson max "$requested_limit" \
+      '{type:"shell_call_output",call_id:$id,max_output_length:$max,output:.}')
+    next=$(printf '%s\n%s\n' "$next" "$tool_output" | "$JQ_BIN" -cs '.[0] + [.[1]]')
     record_openai_tool_result "shell" "$(printf '%s' "$outputs" | "$JQ_BIN" -c '.')"
-  done < <(printf '%s' "$API_RESPONSE" | "$JQ_BIN" -c '.output[] | select(.type == "shell_call" or .type == "function_call")')
+  done <<< "$(printf '%s' "$API_RESPONSE" | "$JQ_BIN" -c '.output[] | select(.type == "shell_call" or .type == "function_call")')"
   if [[ $(printf '%s' "$attachments" | "$JQ_BIN" 'length') -gt 0 ]]; then
-    message=$("$JQ_BIN" -cn --slurpfile files <(printf '%s\n' "$attachments") \
-      '{role:"user",content:([{type:"input_text",text:"Images returned by the read tool are attached."}] + $files[0])}')
-    next=$("$JQ_BIN" -cs '.[0] + [.[1]]' \
-      <(printf '%s\n' "$next") <(printf '%s\n' "$message"))
+    message=$(printf '%s\n' "$attachments" | "$JQ_BIN" -c \
+      '{role:"user",content:([{type:"input_text",text:"Images returned by the read tool are attached."}] + .)}')
+    next=$(printf '%s\n%s\n' "$next" "$message" | "$JQ_BIN" -cs '.[0] + [.[1]]')
   fi
   OPENAI_NEXT_INPUT=$next
   debug_dump openai-next-input.json "$OPENAI_NEXT_INPUT"
@@ -1459,8 +1466,7 @@ run_tool() {
 process_openai_calls() {
   local assistant calls images='[]' id name args result result_text tool_message status
   assistant=$(printf '%s' "$API_RESPONSE" | "$JQ_BIN" -c '.choices[0].message')
-  HISTORY=$("$JQ_BIN" -cs '.[0] + [.[1]]' \
-    <(printf '%s\n' "$HISTORY") <(printf '%s\n' "$assistant"))
+  HISTORY=$(printf '%s\n%s\n' "$HISTORY" "$assistant" | "$JQ_BIN" -cs '.[0] + [.[1]]')
   calls=$(printf '%s' "$assistant" | "$JQ_BIN" -c '.tool_calls // []')
   while IFS= read -r call; do
     [[ -n "$call" ]] || continue
@@ -1472,16 +1478,13 @@ process_openai_calls() {
     result_text=$(printf '%s' "$result" | "$JQ_BIN" -r '.text')
     tool_message=$("$JQ_BIN" -cn --arg id "$id" --arg name "$name" --arg text "$result_text" \
       '{role:"tool",tool_call_id:$id,name:$name,content:$text}')
-    HISTORY=$("$JQ_BIN" -cs '.[0] + [.[1]]' \
-      <(printf '%s\n' "$HISTORY") <(printf '%s\n' "$tool_message"))
+    HISTORY=$(printf '%s\n%s\n' "$HISTORY" "$tool_message" | "$JQ_BIN" -cs '.[0] + [.[1]]')
     if [[ $(printf '%s' "$result" | "$JQ_BIN" -r '.kind') == "image" ]]; then
-      images=$("$JQ_BIN" -cs '.[0] as $a | .[1] as $r | $a + [{type:"text",text:$r.text},{type:"image_url",image_url:{url:("data:"+$r.media_type+";base64,"+$r.data)}}]' \
-        <(printf '%s\n' "$images") <(printf '%s\n' "$result"))
+      images=$(printf '%s\n%s\n' "$images" "$result" | "$JQ_BIN" -cs '.[0] as $a | .[1] as $r | $a + [{type:"text",text:$r.text},{type:"image_url",image_url:{url:("data:"+$r.media_type+";base64,"+$r.data)}}]')
     fi
-  done < <(printf '%s' "$calls" | "$JQ_BIN" -c '.[]')
+  done <<< "$(printf '%s' "$calls" | "$JQ_BIN" -c '.[]')"
   if [[ $(printf '%s' "$images" | "$JQ_BIN" 'length') -gt 0 ]]; then
-    HISTORY=$("$JQ_BIN" -cs '.[0] + [{role:"user",content:.[1]}]' \
-      <(printf '%s\n' "$HISTORY") <(printf '%s\n' "$images"))
+    HISTORY=$(printf '%s\n%s\n' "$HISTORY" "$images" | "$JQ_BIN" -cs '.[0] + [{role:"user",content:.[1]}]')
   fi
   debug_dump history-after-openrouter-tools.json "$HISTORY"
 }
@@ -1489,8 +1492,7 @@ process_openai_calls() {
 process_anthropic_calls() {
   local content results='[]' id name input result result_text block status
   content=$(printf '%s' "$API_RESPONSE" | "$JQ_BIN" -c '.content')
-  HISTORY=$("$JQ_BIN" -cs '.[0] + [{role:"assistant",content:.[1]}]' \
-    <(printf '%s\n' "$HISTORY") <(printf '%s\n' "$content"))
+  HISTORY=$(printf '%s\n%s\n' "$HISTORY" "$content" | "$JQ_BIN" -cs '.[0] + [{role:"assistant",content:.[1]}]')
   while IFS= read -r call; do
     [[ -n "$call" ]] || continue
     id=$(printf '%s' "$call" | "$JQ_BIN" -r '.id'); name=$(printf '%s' "$call" | "$JQ_BIN" -r '.name')
@@ -1504,10 +1506,9 @@ process_anthropic_calls() {
     else
       block=$("$JQ_BIN" -cn --arg id "$id" --arg text "$result_text" '{type:"tool_result",tool_use_id:$id,content:$text}')
     fi
-    results=$("$JQ_BIN" -cs '.[0] + [.[1]]' <(printf '%s\n' "$results") <(printf '%s\n' "$block"))
-  done < <(printf '%s' "$content" | "$JQ_BIN" -c '.[] | select(.type == "tool_use")')
-  HISTORY=$("$JQ_BIN" -cs '.[0] + [{role:"user",content:.[1]}]' \
-    <(printf '%s\n' "$HISTORY") <(printf '%s\n' "$results"))
+    results=$(printf '%s\n%s\n' "$results" "$block" | "$JQ_BIN" -cs '.[0] + [.[1]]')
+  done <<< "$(printf '%s' "$content" | "$JQ_BIN" -c '.[] | select(.type == "tool_use")')"
+  HISTORY=$(printf '%s\n%s\n' "$HISTORY" "$results" | "$JQ_BIN" -cs '.[0] + [{role:"user",content:.[1]}]')
   debug_dump history-after-anthropic-tools.json "$HISTORY"
 }
 
@@ -1569,8 +1570,7 @@ agent_turn() {
   [[ -n "$TURN_MODEL" ]] || TURN_MODEL=$MODEL
   if [[ "$PROVIDER" == "openai" ]]; then agent_turn_openai "$user_text"; return; fi
   user_message=$(printf '%s' "$user_text" | "$JQ_BIN" -Rsc '{role:"user",content:.}')
-  HISTORY=$("$JQ_BIN" -cs '.[0] + [.[1]]' \
-    <(printf '%s\n' "$HISTORY") <(printf '%s\n' "$user_message"))
+  HISTORY=$(printf '%s\n%s\n' "$HISTORY" "$user_message" | "$JQ_BIN" -cs '.[0] + [.[1]]')
   LAST_ANSWER=""
   turn=1
   while [[ "$turn" -le "$MAX_TURNS" ]]; do
@@ -1592,8 +1592,7 @@ agent_turn() {
         apply_interactive_messages
       else
         assistant_content=$(printf '%s' "$API_RESPONSE" | "$JQ_BIN" -c '.content')
-        HISTORY=$("$JQ_BIN" -cs '.[0] + [{role:"assistant",content:.[1]}]' \
-          <(printf '%s\n' "$HISTORY") <(printf '%s\n' "$assistant_content"))
+        HISTORY=$(printf '%s\n%s\n' "$HISTORY" "$assistant_content" | "$JQ_BIN" -cs '.[0] + [{role:"assistant",content:.[1]}]')
         if interactive_stop_requested; then return 130; fi
         apply_interactive_messages
         if [[ "$INTERACTIVE_QUEUED_COUNT" -gt 0 ]]; then
@@ -1621,8 +1620,7 @@ agent_turn() {
         apply_interactive_messages
       else
         assistant_content=$(printf '%s' "$API_RESPONSE" | "$JQ_BIN" -c '.choices[0].message')
-        HISTORY=$("$JQ_BIN" -cs '.[0] + [.[1]]' \
-          <(printf '%s\n' "$HISTORY") <(printf '%s\n' "$assistant_content"))
+        HISTORY=$(printf '%s\n%s\n' "$HISTORY" "$assistant_content" | "$JQ_BIN" -cs '.[0] + [.[1]]')
         if interactive_stop_requested; then return 130; fi
         apply_interactive_messages
         if [[ "$INTERACTIVE_QUEUED_COUNT" -gt 0 ]]; then
@@ -1645,9 +1643,8 @@ agent_turn() {
 
 print_answer() {
   if [[ "$OUTPUT_FORMAT" == "json" ]]; then
-    "$JQ_BIN" -cn --arg provider "$PROVIDER" --arg model "${TURN_MODEL:-$MODEL}" --arg fallback_model "$FALLBACK_MODEL" --arg reasoning "$REASONING" \
-      --rawfile answer <(printf '%s' "$LAST_ANSWER") \
-      '{provider:$provider,model:$model,fallback_model:$fallback_model,reasoning:$reasoning,answer:$answer}'
+    printf '%s' "$LAST_ANSWER" | "$JQ_BIN" -Rsc --arg provider "$PROVIDER" --arg model "${TURN_MODEL:-$MODEL}" --arg fallback_model "$FALLBACK_MODEL" --arg reasoning "$REASONING" \
+      '{provider:$provider,model:$model,fallback_model:$fallback_model,reasoning:$reasoning,answer:.}'
   else printf '%s\n' "$LAST_ANSWER"
   fi
 }

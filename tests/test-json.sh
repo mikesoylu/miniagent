@@ -69,22 +69,40 @@ printf '[{"role":"user","content":"hello"}]\n' > "$TMP/history"
 check_json "Raw-file arguments preserve newlines" '' -cn --rawfile answer "$TMP/answer" '{answer:$answer}'
 check_json "Slurp-file arguments" '' -cn --slurpfile history "$TMP/history" '{messages:$history[0]}'
 check_json "Positional file input" '' -c '.[0].content' "$TMP/history"
+check_json "Standard input between positional files" '{"stdin":true}' -cs . "$TMP/history" - "$TMP/history"
 check_json "Fractional token usage is floored" '{"usage":{"input_tokens":2.5,"output_tokens":1.25}}' -r \
   '(.usage.total_tokens // ((.usage.input_tokens // 0) + (.usage.output_tokens // 0))) | floor'
 check_json "Case-insensitive refusal pattern" '{"error":{"message":"Blocked by the safety policy"}}' -e \
   '(.error.message // "") | test("flagged for possible (cybersecurity|safety) risk|blocked by (a |the )?(safety|content) policy"; "i")'
 check_json "Unsupported filters fail" '{}' 'unsupported_filter'
 
-# Exercise descriptor transport above the Linux per-argument exec limit without
+# Exercise temporary-file transport above the Linux per-argument exec limit without
 # passing the large string to the oracle as an exec argument.
 large=$(awk 'BEGIN {for(i=0;i<140000;i++)printf "x"}')
 large_json=$(printf '%s' "$large" | "$REAL_JQ" -Rs .)
 printf '%s' "$large_json" | "$REAL_JQ" -c '{text:.}' > "$TMP/expected"
 miniagent_jq -cn --argjson text "$large_json" '{text:$text}' > "$TMP/actual"
 if cmp -s "$TMP/expected" "$TMP/actual"; then
-  printf 'ok - Large JSON arguments use descriptor transport\n'; PASS=$((PASS + 1))
+  printf 'ok - Large JSON arguments use temporary-file transport\n'; PASS=$((PASS + 1))
 else
-  printf 'not ok - Large JSON arguments use descriptor transport\n'; FAIL=$((FAIL + 1))
+  printf 'not ok - Large JSON arguments use temporary-file transport\n'; FAIL=$((FAIL + 1))
+fi
+
+# The large-argument transport must leave stdin intact and clean up on errors.
+mkdir "$TMP/args"
+printf '%s' "$large_json" | "$REAL_JQ" -c '{text:.,input:"from stdin"}' > "$TMP/expected"
+printf '"from stdin"' | TMPDIR="$TMP/args" miniagent_jq -c --argjson text "$large_json" '{text:$text,input:.}' > "$TMP/actual"
+if cmp -s "$TMP/expected" "$TMP/actual"; then
+  printf 'ok - Large arguments preserve stdin\n'; PASS=$((PASS + 1))
+else
+  printf 'not ok - Large arguments preserve stdin\n'; FAIL=$((FAIL + 1))
+fi
+TMPDIR="$TMP/args" miniagent_jq -cn --argjson text "$large_json" unsupported_filter >/dev/null 2>&1
+large_status=$?
+if [[ "$large_status" -ne 0 && -z $(ls -A "$TMP/args") ]]; then
+  printf 'ok - Large argument files are cleaned up on success and failure\n'; PASS=$((PASS + 1))
+else
+  printf 'not ok - Large argument files are cleaned up on success and failure\n'; FAIL=$((FAIL + 1))
 fi
 
 # The fallback is a function in the harness; it must not leak its byte locale.
