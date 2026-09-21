@@ -246,6 +246,52 @@ expect eof
 EXPECT_PIPED_SCRIPT
   if [[ $? -eq 0 ]]; then ok "Piped script completes an interactive model turn"; else not_ok "Piped script completes an interactive model turn"; fi
 
+  EXPECT_ROOT="$ROOT" EXPECT_TMP="$TMP" expect <<'EXPECT_WRITE_ONLY_TTY'
+set timeout 15
+log_user 0
+set root $env(EXPECT_ROOT)
+set tmp $env(EXPECT_TMP)
+# Explicit redirections open stdout and stderr write-only, as on some consoles.
+spawn bash -c "cat '$root/miniagent.sh' | env OPENAI_API_KEY=test CURL_BIN='$tmp/curl' bash >/dev/tty 2>/dev/tty"
+expect {
+  "> " {}
+  timeout {exit 1}
+  eof {exit 1}
+}
+# A single keystroke must not cause an endless prompt loop. Readline may
+# legitimately redraw once when it initializes terminal editing.
+send -- "i"
+set timeout 1
+set redraws 0
+expect {
+  "> " {
+    incr redraws
+    if {$redraws > 3} {exit 1}
+    exp_continue -continue_timer
+  }
+  eof {exit 1}
+  timeout {}
+}
+send -- "nspect\r"
+set timeout 15
+expect {
+  "openai done" {}
+  timeout {exit 1}
+  eof {exit 1}
+}
+expect {
+  "> " {}
+  timeout {exit 1}
+  eof {exit 1}
+}
+send -- "/quit\r"
+expect {
+  eof {}
+  timeout {exit 1}
+}
+EXPECT_WRITE_ONLY_TTY
+  if [[ $? -eq 0 ]]; then ok "Piped startup reads a write-only console after the first keystroke"; else not_ok "Piped startup reads a write-only console after the first keystroke"; fi
+
   EXPECT_ROOT="$ROOT" EXPECT_TMP="$TMP" expect <<'EXPECT_QUEUE'
 set timeout 15
 log_user 0

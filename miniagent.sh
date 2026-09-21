@@ -791,7 +791,9 @@ reattach_piped_script_input() {
   [[ ! -t 0 && -z "$SCRIPT_SOURCE" ]] || return 0
   [[ "$INTERACTIVE" -eq 1 || -z "$PROMPT" ]] || return 0
   [[ -t 1 || -t 2 ]] || die "interactive mode requires a terminal (for Docker, allocate one with -it)"
-  if [[ -t 2 ]]; then exec 0<&2; else exec 0<&1; fi
+  # A terminal on stdout/stderr can be write-only. Open a readable descriptor
+  # instead of duplicating it onto stdin (which makes Readline repeatedly fail).
+  exec 0</dev/tty || die "cannot open the controlling terminal for input"
 }
 select_provider() {
   if [[ -z "${OPENAI_API_KEY:-}" && -z "${ANTHROPIC_API_KEY:-}" && -z "${OPENROUTER_API_KEY:-}" ]]; then

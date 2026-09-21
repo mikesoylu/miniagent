@@ -1,6 +1,6 @@
 A single Bash script agent harness with minimal dependencies. Built for GitHub Actions, CI/CD pipelines, remote SSH sessions, and similar headless environments. It works with OpenAI, Anthropic, and OpenRouter.
 
-The complete script, including its embedded Bash/awk JSON fallback, is **25.41 KiB gzipped** (26,016 bytes), measured with `gzip -n -c miniagent.sh | wc -c` using default compression.
+The complete script, including its embedded Bash/awk JSON fallback, is **25.49 KiB gzipped** (26,106 bytes), measured with `gzip -n -c miniagent.sh | wc -c` using default compression.
 
 Run an agent loop directly without installing:
 
