@@ -53,6 +53,11 @@ for input in '[]' '[1,2,3]' '"abcd"' '"é😀日本語"'; do
   done
 done
 check_json "History append via slurped input" $'[{"role":"user","content":"hello"}]\n{"role":"assistant","content":"hi"}\n' -cs '.[0] + [.[1]]'
+for input in '[]' '{}' '[{"items":[1,true,null,"text"]},{"empty":[]}]'; do
+  check_json "Compact container rendering (legacy BusyBox concatenation)" "$input" -c .
+  check_json "Pretty container rendering (legacy BusyBox concatenation)" "$input" .
+done
+check_json "Join strings and primitives (legacy BusyBox concatenation)" '["first",1,true,null,"last"]' -r 'join(":")'
 check_json "Anthropic queued user messages" '' -cn --argjson history '[{"role":"assistant","content":[]}]' --argjson queued '["one","two"]' \
   '$history + [{role:"user",content:[$queued[] | {type:"text",text:.}]}]'
 check_json "Anthropic queue after tool results" '' -cn --argjson history '[{"role":"user","content":[{"type":"tool_result","content":"done"}]}]' --argjson queued '["one","two"]' \

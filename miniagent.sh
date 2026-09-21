@@ -304,11 +304,12 @@ function render(v,pretty,level, out,i,k,sep) {
   if(T[v]=="string") {out=quote(V[v]);if(!pretty)Cache[v]=out;return out}
   out=(T[v]=="array"?"[":"{");sep=""
   for(i=1;i<=L[v];i++){
-    out=out sep (pretty?"\n" spaces(level+2):"")
+    # Older BusyBox treats a bare variable followed by ( as a function call.
+    out=(out sep) (pretty?"\n" spaces(level+2):"")
     if(T[v]=="object")out=out quote(K[v,i]) (pretty?": ":":")
     out=out render(A[v,i],pretty,level+2);sep=","
   }
-  out=out (pretty&&L[v]?"\n" spaces(level):"") (T[v]=="array"?"]":"}")
+  out=(out) (pretty&&L[v]?"\n" spaces(level):"") (T[v]=="array"?"]":"}")
   if(!pretty)Cache[v]=out;return out
 }
 function number(n) { return value("number",sprintf("%.17g",n)) }
@@ -505,7 +506,7 @@ function call(n,input,e, name,r,args,a,b,i,j,s,sep,tmp,x,pat,flags) {
   if(name=="select"){args=eval(C[n,1],input,e);for(i=1;i<=L[args];i++)if(truth(A[args,i]))push(r,input);return r}
   if(name=="map"){if(T[input]!="array"&&T[input]!="object")return bad("invalid map");a=arr();for(i=1;i<=L[input];i++)append(a,eval(C[n,1],A[input,i],e));return one(a)}
   if(name=="any"){args=eval(C[n,1],input,e);for(i=1;i<=L[args];i++){tmp=eval(C[n,2],A[args,i],e);for(j=1;j<=L[tmp];j++)if(truth(A[tmp,j]))return one(True)}return one(False)}
-  if(name=="join"){if(T[input]!="array")return bad("invalid join");args=eval(C[n,1],input,e);for(i=1;i<=L[args];i++){s="";sep="";for(j=1;j<=L[input];j++){a=A[input,j];if(T[a]=="array"||T[a]=="object")return bad("join of container");s=s sep (T[a]=="string"?V[a]:T[a]=="null"?"":render(a,0,0));sep=V[A[args,i]]}push(r,value("string",s))}return r}
+  if(name=="join"){if(T[input]!="array")return bad("invalid join");args=eval(C[n,1],input,e);for(i=1;i<=L[args];i++){s="";sep="";for(j=1;j<=L[input];j++){a=A[input,j];if(T[a]=="array"||T[a]=="object")return bad("join of container");s=(s sep) (T[a]=="string"?V[a]:T[a]=="null"?"":render(a,0,0));sep=V[A[args,i]]}push(r,value("string",s))}return r}
   if(name=="startswith"||name=="contains"||name=="has"){args=eval(C[n,1],input,e);for(i=1;i<=L[args];i++){a=A[args,i];if(name=="contains")x=contains(input,a);else if(name=="startswith"){if(T[input]!="string"||T[a]!="string")return bad("invalid startswith");x=index(V[input],V[a])==1}else if(T[input]=="object")x=((input,V[a]) in O);else if(T[input]=="array")x=V[a]>=0&&V[a]<L[input];else x=0;push(r,x?True:False)}return r}
   if(name=="test"){if(T[input]!="string")return bad("test requires string");args=eval(C[n,1],input,e);flags="";if(C[n,2]){tmp=eval(C[n,2],input,e);flags=V[A[tmp,1]];if(flags!=""&&flags!="i")return bad("only regex flag i supported")}
     for(i=1;i<=L[args];i++){pat=V[A[args,i]];s=V[input];if(flags=="i"){pat=tolower(pat);s=tolower(s)}push(r,s~pat?True:False)}return r

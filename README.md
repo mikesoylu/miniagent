@@ -1,6 +1,6 @@
 A single Bash script agent harness with minimal dependencies. Built for GitHub Actions, CI/CD pipelines, remote SSH sessions, and similar headless environments. It works with OpenAI, Anthropic, and OpenRouter.
 
-The complete script, including its embedded Bash/awk JSON fallback, is **25.49 KiB gzipped** (26,106 bytes), measured with `gzip -n -c miniagent.sh | wc -c` using default compression.
+The complete script, including its embedded Bash/awk JSON fallback, is **25.54 KiB gzipped** (26,153 bytes), measured with `gzip -n -c miniagent.sh | wc -c` using default compression.
 
 Run an agent loop directly without installing:
 
@@ -204,6 +204,8 @@ To test the fallback with Alpine’s BusyBox awk (jq is installed only for the t
 docker run --rm -v "$PWD:/work:ro" -w /work alpine sh -c \
   'apk add --no-cache bash curl jq && bash tests/test-json.sh && JQ_BIN=miniagent_jq bash tests/test.sh'
 ```
+
+The fallback also supports older BusyBox awk parsing. The JSON comparison suite uses current jq exit codes; use jq 1.8 or later as its oracle.
 
 To cover environments without `/dev/fd` or `/dev/stdin`, run both backends in a disposable container:
 
