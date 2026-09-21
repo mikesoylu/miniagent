@@ -276,12 +276,14 @@ function unquote(s, out,i,c,h,low) {
     } else if(c=="n")out=out "\n";else if(c=="r")out=out "\r";else if(c=="t")out=out "\t";else if(c=="b")out=out sprintf("%c",8);else if(c=="f")out=out sprintf("%c",12);else if(c=="\\"||c=="/"||c=="\"")out=out c;else die("invalid string escape")
   }return out s
 }
-function quote(s, i,c,rep) {
+function quote(s, out,i,c) {
   if(s!~/["\\\001-\037]/)return "\"" s "\""
-  gsub(/\\/,"\\\\",s);gsub(/"/,"\\\"",s)
-  gsub(/\n/,"\\n",s);gsub(/\r/,"\\r",s);gsub(/\t/,"\\t",s)
-  if(s~/[\001-\037]/)for(i=1;i<32;i++)if(i!=9&&i!=10&&i!=13){c=sprintf("%c",i);rep=(i==8?"\\b":i==12?"\\f":sprintf("\\u%04x",i));gsub(c,rep,s)}
-  return "\"" s "\""
+  # Concatenation avoids implementation-specific gsub replacement backslashes.
+  out="\""
+  while(match(s,/["\\\001-\037]/)) {
+    i=RSTART;c=substr(s,i,1);out=out substr(s,1,i-1) Escape[c];s=substr(s,i+1)
+  }
+  return out s "\""
 }
 function spaces(n, s) { s="";while(n-->0)s=s " ";return s }
 function render(v,pretty,level, out,i,k,sep) {
@@ -325,7 +327,8 @@ function jparse( c,n,k,start,tail,raw) {
     else if(substr(tail,1,4)=="true"){JP+=4;n=True}
     else if(substr(tail,1,5)=="false"){JP+=5;n=False}
     else die("invalid JSON at byte " JP)
-    if(JP<=length(JS) && substr(JS,JP,1)!~/[ \t\r\n,\]}]/)die("invalid JSON token at byte " JP)
+    # A literal closing bracket must come first in a portable bracket expression.
+    if(JP<=length(JS) && substr(JS,JP,1)!~/[] \t\r\n,}]/)die("invalid JSON token at byte " JP)
   }
   JD--;return n
 }
@@ -504,6 +507,9 @@ function call(n,input,e, name,r,args,a,b,i,j,s,sep,tmp,x,pat,flags) {
 function readexact(path, s,line,status,old) {old=RS;RS="^$";s="";while((status=(getline line < path))>0){if(length(s))die("NUL bytes in raw input are unsupported");s=line}if(status<0)die("cannot read " path);if(path!="/dev/stdin")close(path);RS=old;return s}
 BEGIN {
   EC=2
+  for(ai=1;ai<32;ai++)Escape[sprintf("%c",ai)]=sprintf("\\u%04x",ai)
+  Escape["\\"]="\\\\";Escape["\""]="\\\""
+  Escape["\n"]="\\n";Escape["\r"]="\\r";Escape["\t"]="\\t";Escape["\b"]="\\b";Escape["\f"]="\\f"
   if(ARGV[1]=="--miniq-args-file") {
     packed=readexact(ARGV[2]);for(ai=1;ai<ARGC;ai++)delete ARGV[ai];ARGC=1
     while(length(packed)) {

@@ -25,7 +25,7 @@ check_json() {
   fi
 }
 
-for text in '' 0 false $'line\nline\n' $'quote " slash \\ tab\t' 'é😀日本語' '$(not executed); `not executed`' $'\001\b\f\037'; do
+for text in '' 0 false $'line\nline\n' $'quote " slash \\ tab\t' 'é😀日本語' 'backslashes \\ and literal \n \t' '$(not executed); `not executed`' $'\001\b\f\037'; do
   check_json "Bash constructor escapes strings" '' -cn --arg e "$text" '{reasoning:{effort:$e}}'
   check_json "Raw input preserves strings and trailing newlines" "$text" -Rsc '{role:"user",content:.}'
   encoded=$("$REAL_JQ" -cn --arg text "$text" '{text:$text}')
@@ -34,6 +34,9 @@ for text in '' 0 false $'line\nline\n' $'quote " slash \\ tab\t' 'é😀日本�
 done
 for input in '' null false true 0 '""' '[]' '{}'; do
   check_json "Exit status for empty, false, null and truthy values" "$input" -e .
+done
+for input in '{"enabled":true,"disabled":false,"value":null,"count":1}' '[0,1,-2,3.5]' '{"items":[true,false,null,{"count":1}],"done":true}'; do
+  check_json "Primitive tokens before commas and closing brackets (BusyBox awk)" "$input" -c .
 done
 for input in 'oops' '1true' 'truefalse' 'nullx' '{' '{"x":}' '[1,]' '{"x":1,}' $'{"x":"\n"}'; do
   check_json "Invalid JSON fails validation" "$input" -e .

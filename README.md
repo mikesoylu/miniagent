@@ -1,6 +1,6 @@
 A single Bash script agent harness with minimal dependencies. Built for GitHub Actions, CI/CD pipelines, remote SSH sessions, and similar headless environments. It works with OpenAI, Anthropic, and OpenRouter.
 
-The complete script, including its embedded Bash/awk JSON fallback, is **25.25 KiB gzipped** (25,856 bytes), measured with `gzip -n -c miniagent.sh | wc -c` using default compression.
+The complete script, including its embedded Bash/awk JSON fallback, is **25.33 KiB gzipped** (25,934 bytes), measured with `gzip -n -c miniagent.sh | wc -c` using default compression.
 
 Run an agent loop directly without installing:
 
@@ -151,7 +151,7 @@ The default base URLs are the providers' public APIs. `ANTHROPIC_VERSION` defaul
 
 `CURL_BIN` and `JQ_BIN` may also be set to alternate executable paths, primarily for testing. A custom `JQ_BIN` path must exist; it is not replaced automatically. Set `JQ_BIN=miniagent_jq` to force the embedded fallback even when jq is installed.
 
-The fallback implements the jq filters used by this harness, not the full jq language. It requires awk with regex record separators (as provided by current macOS awk, GNU awk, and mawk), uses double-precision arithmetic, and does not support NUL characters. Native jq remains preferred for performance.
+The fallback implements the jq filters used by this harness, not the full jq language. It requires awk with regex record separators (as provided by current macOS awk, GNU awk, mawk, and BusyBox awk), uses double-precision arithmetic, and does not support NUL characters. Native jq remains preferred for performance.
 
 ## Provider tools and file support
 
@@ -196,4 +196,11 @@ The test suite uses jq for its mocks and assertions, tests startup without jq, a
 bash tests/test.sh
 JQ_BIN=miniagent_jq bash tests/test.sh
 bash tests/test-json.sh
+```
+
+To test the fallback with Alpine’s BusyBox awk (jq is installed only for the test mocks and assertions):
+
+```bash
+docker run --rm -v "$PWD:/work:ro" -w /work alpine sh -c \
+  'apk add --no-cache bash curl jq && bash tests/test-json.sh && JQ_BIN=miniagent_jq bash tests/test.sh'
 ```
