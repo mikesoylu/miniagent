@@ -44,6 +44,7 @@ CONTEXT_TOKENS=0
 CONTEXT_TOKENS_KNOWN=0
 COMPACTION_SUMMARY=""
 LAST_ANSWER=""
+GENERATION_INFO=""
 API_RESPONSE=""
 CAPTURED_RESULT=""
 CURL_BIN="${CURL_BIN:-curl}"
@@ -1571,10 +1572,11 @@ agent_turn_openai() {
 agent_turn() {
   # Dynamic scope lets either provider loop record its final attempted turn.
   local generation_turn=0 status=0 provider_label=$PROVIDER
+  GENERATION_INFO=""
   agent_turn_run "$@" || status=$?
   if [[ "$generation_turn" -gt 0 ]]; then
     [[ "$PROVIDER" != "openai" ]] || provider_label="openai responses"
-    info "model ${TURN_MODEL:-$MODEL} · $provider_label · reasoning $REASONING · context $(context_usage) · turn $generation_turn/$MAX_TURNS"
+    GENERATION_INFO="model ${TURN_MODEL:-$MODEL} · $provider_label · reasoning $REASONING · context $(context_usage) · turn $generation_turn/$MAX_TURNS"
   fi
   return "$status"
 }
@@ -1653,6 +1655,11 @@ agent_turn_run() {
   done
   LAST_ANSWER="Stopped after reaching the $MAX_TURNS-turn limit."
   return 2
+}
+
+print_generation_info() {
+  [[ -z "$GENERATION_INFO" ]] || info "$GENERATION_INFO"
+  GENERATION_INFO=""
 }
 
 print_answer() {
@@ -1786,6 +1793,7 @@ interactive_loop() {
           INTERACTIVE_STOP_REQUESTED=0
           printf 'execution stopped\n'
         fi
+        print_generation_info
         ;;
     esac
   done
@@ -1805,16 +1813,17 @@ main() {
   if [[ -z "$PROMPT" && ! -t 0 ]]; then PROMPT=$(cat); fi
   if [[ -n "$PROMPT" ]]; then
     if [[ "$INTERACTIVE" -eq 1 ]]; then
-      run_interactive_agent_turn "$PROMPT" || { [[ -n "$LAST_ANSWER" ]] && print_answer; return 1; }
+      run_interactive_agent_turn "$PROMPT" || { [[ -n "$LAST_ANSWER" ]] && print_answer; print_generation_info; return 1; }
     else
-      agent_turn "$PROMPT" || { [[ -n "$LAST_ANSWER" ]] && print_answer; return 1; }
+      agent_turn "$PROMPT" || { [[ -n "$LAST_ANSWER" ]] && print_answer; print_generation_info; return 1; }
     fi
     [[ -n "$LAST_ANSWER" ]] && print_answer
-    [[ "$INTERACTIVE" -eq 1 ]] || return 0
     if [[ "$INTERACTIVE_STOP_REQUESTED" -eq 1 ]]; then
       INTERACTIVE_STOP_REQUESTED=0
       printf 'execution stopped\n'
     fi
+    print_generation_info
+    [[ "$INTERACTIVE" -eq 1 ]] || return 0
   fi
   interactive_loop
 }
