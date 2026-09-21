@@ -1,5 +1,7 @@
 A single Bash script agent harness with minimal dependencies. Built for GitHub Actions, CI/CD pipelines, remote SSH sessions, and similar headless environments. It works with OpenAI, Anthropic, and OpenRouter.
 
+The complete script, including its embedded Bash/awk JSON fallback, is **25.25 KiB gzipped** (25,856 bytes), measured with `gzip -n -c miniagent.sh | wc -c` using default compression.
+
 Run an agent loop directly without installing:
 
 ```bash
@@ -26,7 +28,8 @@ curl -fsSL https://miniagent.sh | bash
 ## Requirements
 
 - Bash 3.2+
-- `curl` and `jq`
+- `curl`
+- Optional: `jq` for faster JSON processing; when it is unavailable, miniagent uses its embedded Bash/awk fallback.
 - Standard Unix utilities used by the harness: `awk`, `base64`, `cat`, `chmod`, `cp`, `date`, `dd`, `find`, `head`, `mkdir`, `mktemp`, `rm`, `sort`, `stty`, `tail`, `tr`, `uname`, and `wc`
 - Standard agent editing and inspection utilities: `sed` and `nl`
 - Optional: `file` for MIME detection, `strings` for extracting text from unknown binary files, and GNU `timeout` (or `gtimeout`) to enforce command timeouts
@@ -37,7 +40,7 @@ curl -fsSL https://miniagent.sh | bash
 curl -fsSL https://miniagent.sh/install | bash
 ```
 
-The installer detects macOS or Linux, downloads `jq` to `~/.local/bin` when needed, and places `miniagent` alongside it. It does not require `sudo`.
+The installer checks for standard Unix utilities and installs the single `miniagent` script in `~/.local/bin`. JSON processing uses `jq` when available and the embedded Bash/awk fallback otherwise. No jq binary or companion files are downloaded, and `sudo` is not required.
 
 ## Quick start
 
@@ -146,7 +149,9 @@ The default base URLs are the providers' public APIs. `ANTHROPIC_VERSION` defaul
 | `MINIAGENT_DEBUG` | Enable diagnostic logging with `1` | `0` |
 | `MINIAGENT_DEBUG_DIR` | Diagnostic bundle directory; otherwise a temporary directory is created | System temp directory |
 
-`CURL_BIN` and `JQ_BIN` may also be set to alternate executable paths, primarily for testing.
+`CURL_BIN` and `JQ_BIN` may also be set to alternate executable paths, primarily for testing. A custom `JQ_BIN` path must exist; it is not replaced automatically. Set `JQ_BIN=miniagent_jq` to force the embedded fallback even when jq is installed.
+
+The fallback implements the jq filters used by this harness, not the full jq language. It requires awk with regex record separators (as provided by current macOS awk, GNU awk, and mawk), uses double-precision arithmetic, and does not support NUL characters. Native jq remains preferred for performance.
 
 ## Provider tools and file support
 
@@ -185,8 +190,10 @@ API requests are non-streaming to keep the script compact and provider-neutral. 
 
 ## Tests
 
-The test suite uses mocked provider responses and does not require real API keys:
+The test suite uses jq for its mocks and assertions, tests startup without jq, and does not require real API keys:
 
 ```bash
 bash tests/test.sh
+JQ_BIN=miniagent_jq bash tests/test.sh
+bash tests/test-json.sh
 ```

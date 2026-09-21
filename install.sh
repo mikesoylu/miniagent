@@ -4,9 +4,7 @@ set -euo pipefail
 
 SCRIPT_URL="${MINIAGENT_SCRIPT_URL:-https://miniagent.sh}"
 INSTALL_DIR="${MINIAGENT_INSTALL_DIR:-$HOME/.local/bin}"
-DEPENDENCY_DIR="${MINIAGENT_DEPENDENCY_DIR:-${XDG_CACHE_HOME:-${HOME:-${TMPDIR:-/tmp}}/.cache}/miniagent/bin}"
 TARGET="$INSTALL_DIR/miniagent"
-JQ_VERSION="1.7.1"
 MODE="install"
 
 say() { printf 'miniagent: %s\n' "$*" >&2; }
@@ -27,38 +25,11 @@ case "${1:-}" in
 esac
 [[ $# -eq 0 ]] || die "unexpected arguments: $*"
 
-download_jq() {
-  local destination destination_dir os architecture asset url temporary_file
-  destination=$1
-  destination_dir=${destination%/*}
-  os=$(uname -s)
-  architecture=$(uname -m)
-
-  case "$os:$architecture" in
-    Linux:x86_64|Linux:amd64) asset="jq-linux-amd64" ;;
-    Linux:aarch64|Linux:arm64) asset="jq-linux-arm64" ;;
-    Darwin:x86_64|Darwin:amd64) asset="jq-macos-amd64" ;;
-    Darwin:arm64|Darwin:aarch64) asset="jq-macos-arm64" ;;
-    *) die "no prebuilt jq is available for $os/$architecture" ;;
-  esac
-
-  url="${MINIAGENT_JQ_URL:-https://github.com/jqlang/jq/releases/download/jq-$JQ_VERSION/$asset}"
-  mkdir -p "$destination_dir"
-  temporary_file=$(mktemp "$destination_dir/.jq.XXXXXX")
-  trap 'rm -f "$temporary_file"' EXIT
-  say "downloading jq $JQ_VERSION for $os/$architecture"
-  curl -fsSL "$url" -o "$temporary_file"
-  chmod 0755 "$temporary_file"
-  "$temporary_file" --version >/dev/null 2>&1 || die "downloaded jq failed validation"
-  mv -f "$temporary_file" "$destination"
-  trap - EXIT
-}
-
 ensure_dependencies() {
-  local command_name jq_destination
+  local command_name
   local -a required_commands missing_commands
   required_commands=(
-    bash curl awk base64 cat chmod cp date find head mkdir mktemp mv rm sort
+    bash curl awk base64 cat chmod cp date dd find head mkdir mktemp mv rm sort
     stty tail tr uname wc sed nl
   )
   missing_commands=()
@@ -67,19 +38,6 @@ ensure_dependencies() {
   done
   if [[ ${#missing_commands[@]} -gt 0 ]]; then
     die "required standard Unix commands not found: ${missing_commands[*]}"
-  fi
-
-  if has jq && [[ "${MINIAGENT_FORCE_LOCAL_JQ:-0}" != "1" ]]; then
-    return 0
-  fi
-
-  if [[ "$MODE" == "dependencies-only" ]]; then
-    jq_destination="$DEPENDENCY_DIR/jq"
-  else
-    jq_destination="$INSTALL_DIR/jq"
-  fi
-  if [[ ! -x "$jq_destination" ]] || ! "$jq_destination" --version >/dev/null 2>&1; then
-    download_jq "$jq_destination"
   fi
 }
 

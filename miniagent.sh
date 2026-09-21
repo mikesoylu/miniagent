@@ -48,8 +48,6 @@ API_RESPONSE=""
 CAPTURED_RESULT=""
 CURL_BIN="${CURL_BIN:-curl}"
 JQ_BIN="${JQ_BIN:-jq}"
-INSTALL_URL="${MINIAGENT_INSTALL_URL:-https://miniagent.sh/install}"
-DEPENDENCY_DIR="${MINIAGENT_DEPENDENCY_DIR:-${XDG_CACHE_HOME:-${HOME:-${TMPDIR:-/tmp}}/.cache}/miniagent/bin}"
 OPENROUTER_COMPLETIONS_PATH="/chat/completions"
 PUBLIC_PROXY=0
 if [[ -t 2 ]]; then
@@ -104,33 +102,457 @@ Interactive commands:
 EOF
 }
 need_cmd() { command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"; }
-bootstrap_dependencies() {
-  local command_name
-  local -a required_commands missing_commands
-  required_commands=("$JQ_BIN" base64 awk)
-  if [[ -t 0 && ( "$INTERACTIVE" -eq 1 || -z "$PROMPT" ) ]]; then
-    required_commands+=(stty)
+# Embedded jq subset: keep this in the script so downloaded and piped copies
+# work without companion files. Prefer native jq; this fallback supports only
+# miniagent filters. It requires awk with regex record separators, uses double
+# precision arithmetic, and does not support NUL characters or general jq regexes.
+miniq_quote() {
+  local v=$1 i ch replacement
+  v=${v//\\/\\\\}; v=${v//\"/\\\"}
+  v=${v//$'\n'/\\n}; v=${v//$'\r'/\\r}; v=${v//$'\t'/\\t}
+  v=${v//$'\b'/\\b}; v=${v//$'\f'/\\f}
+  if [[ $v == *[$'\001'-$'\037']* ]]; then
+    for ((i=1; i<32; i++)); do
+      printf -v ch '\\%03o' "$i"; printf -v ch '%b' "$ch"
+      printf -v replacement '\\u%04x' "$i"; v=${v//"$ch"/"$replacement"}
+    done
   fi
-  missing_commands=()
-  for command_name in "${required_commands[@]}"; do
-    command -v "$command_name" >/dev/null 2>&1 || missing_commands+=("$command_name")
+  miniq_quoted=\"$v\"
+}
+miniq_construct() {
+  local name encoded filter miniq_quoted
+  while (($#)); do
+    case $1 in
+      -cn|-nc) shift ;;
+      --arg|--argjson)
+        (($#>=3)) || return 1
+        name=$2
+        [[ $name =~ ^[a-zA-Z_][a-zA-Z_0-9]*$ ]] || return 1
+        if [[ $1 == --arg ]]; then
+          ((${#3}<=8192)) || return 1
+          miniq_quote "$3"; encoded=$miniq_quoted
+        else
+          # Containers and nonintegral numbers go through the validating parser.
+          case $3 in true|false|null|'[]'|'{}') encoded=$3 ;;
+            *) [[ $3 =~ ^-?(0|[1-9][0-9]{0,14})$ ]] || return 1; encoded=$3 ;;
+          esac
+        fi
+        local "miniq_arg_$name"
+        printf -v "miniq_arg_$name" '%s' "$encoded"
+        shift 3 ;;
+      -*) return 1 ;;
+      *) filter=$1; shift; (($#==0)) || return 1 ;;
+    esac
   done
-  [[ ${#missing_commands[@]} -gt 0 ]] || return 0
+  case ${filter-} in
+    '[]')
+      printf '%s' '[]'; printf '\n'; return 0 ;;
+    '[
+    {type:"function",function:{name:"read",description:"Read a text file, attach an image no larger than 1 MiB, or list a directory.",parameters:{type:"object",properties:{path:{type:"string",description:"Absolute path or path relative to the working directory"},offset:{type:"integer",minimum:1,description:"First line to read (default 1)"},limit:{type:"integer",minimum:1,maximum:2000,description:"Maximum lines or directory entries (default 250)"}},required:["path"],additionalProperties:false}}},
+    {type:"function",function:{name:"shell",description:"Run a shell command in the working directory. Use for searching, editing files, building, and testing.",parameters:{type:"object",properties:{command:{type:"string",description:"Shell command to execute through Bash"}},required:["command"],additionalProperties:false}}}
+  ]')
+      printf '%s' '[{"type":"function","function":{"name":"read","description":"Read a text file, attach an image no larger than 1 MiB, or list a directory.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Absolute path or path relative to the working directory"},"offset":{"type":"integer","minimum":1,"description":"First line to read (default 1)"},"limit":{"type":"integer","minimum":1,"maximum":2000,"description":"Maximum lines or directory entries (default 250)"}},"required":["path"],"additionalProperties":false}}},{"type":"function","function":{"name":"shell","description":"Run a shell command in the working directory. Use for searching, editing files, building, and testing.","parameters":{"type":"object","properties":{"command":{"type":"string","description":"Shell command to execute through Bash"}},"required":["command"],"additionalProperties":false}}}]'; printf '\n'; return 0 ;;
+    '{}')
+      printf '%s' '{}'; printf '\n'; return 0 ;;
+    '{tools:$tools,tool_choice:"auto",parallel_tool_calls:false}')
+      [[ ${miniq_arg_tools+set} ]] || return 1
+      printf '%s' '{"tools":' "$miniq_arg_tools" ',"tool_choice":"auto","parallel_tool_calls":false}'; printf '\n'; return 0 ;;
+    '{reasoning:{effort:$e}}')
+      [[ ${miniq_arg_e+set} ]] || return 1
+      printf '%s' '{"reasoning":{"effort":' "$miniq_arg_e" '}}'; printf '\n'; return 0 ;;
+    '{previous_response_id:$id}')
+      [[ ${miniq_arg_id+set} ]] || return 1
+      printf '%s' '{"previous_response_id":' "$miniq_arg_id" '}'; printf '\n'; return 0 ;;
+    '{tools:$tools,tool_choice:{type:"auto"}}')
+      [[ ${miniq_arg_tools+set} ]] || return 1
+      printf '%s' '{"tools":' "$miniq_arg_tools" ',"tool_choice":{"type":"auto"}}'; printf '\n'; return 0 ;;
+    '{"thinking":{"type":"disabled"}}')
+      printf '%s' '{"thinking":{"type":"disabled"}}'; printf '\n'; return 0 ;;
+    '{thinking:{type:"adaptive"},output_config:{effort:$e}}')
+      [[ ${miniq_arg_e+set} ]] || return 1
+      printf '%s' '{"thinking":{"type":"adaptive"},"output_config":{"effort":' "$miniq_arg_e" '}}'; printf '\n'; return 0 ;;
+    '{role:"user",content:$prompt}')
+      [[ ${miniq_arg_prompt+set} ]] || return 1
+      printf '%s' '{"role":"user","content":' "$miniq_arg_prompt" '}'; printf '\n'; return 0 ;;
+    '[{role:"user",content:[{type:"input_text",text:$text}]}]')
+      [[ ${miniq_arg_text+set} ]] || return 1
+      printf '%s' '[{"role":"user","content":[{"type":"input_text","text":' "$miniq_arg_text" '}]}]'; printf '\n'; return 0 ;;
+    '{kind:"error",text:$t}')
+      [[ ${miniq_arg_t+set} ]] || return 1
+      printf '%s' '{"kind":"error","text":' "$miniq_arg_t" '}'; printf '\n'; return 0 ;;
+    '{kind:"error",text:"PDF files are not supported by the read tool."}')
+      printf '%s' '{"kind":"error","text":"PDF files are not supported by the read tool."}'; printf '\n'; return 0 ;;
+    '{kind:"text",text:$text}')
+      [[ ${miniq_arg_text+set} ]] || return 1
+      printf '%s' '{"kind":"text","text":' "$miniq_arg_text" '}'; printf '\n'; return 0 ;;
+    '{kind:"text",text:$text,exit_status:$status}')
+      [[ ${miniq_arg_text+set} ]] || return 1
+      [[ ${miniq_arg_status+set} ]] || return 1
+      printf '%s' '{"kind":"text","text":' "$miniq_arg_text" ',"exit_status":' "$miniq_arg_status" '}'; printf '\n'; return 0 ;;
+    '{stdout:$stdout,stderr:$stderr,outcome:{type:"timeout"}}')
+      [[ ${miniq_arg_stdout+set} ]] || return 1
+      [[ ${miniq_arg_stderr+set} ]] || return 1
+      printf '%s' '{"stdout":' "$miniq_arg_stdout" ',"stderr":' "$miniq_arg_stderr" ',"outcome":{"type":"timeout"}}'; printf '\n'; return 0 ;;
+    '{stdout:$stdout,stderr:$stderr,outcome:{type:"exit",exit_code:$status}}')
+      [[ ${miniq_arg_stdout+set} ]] || return 1
+      [[ ${miniq_arg_stderr+set} ]] || return 1
+      [[ ${miniq_arg_status+set} ]] || return 1
+      printf '%s' '{"stdout":' "$miniq_arg_stdout" ',"stderr":' "$miniq_arg_stderr" ',"outcome":{"type":"exit","exit_code":' "$miniq_arg_status" '}}'; printf '\n'; return 0 ;;
+    '{type:"function_call_output",call_id:$id,output:$output}')
+      [[ ${miniq_arg_id+set} ]] || return 1
+      [[ ${miniq_arg_output+set} ]] || return 1
+      printf '%s' '{"type":"function_call_output","call_id":' "$miniq_arg_id" ',"output":' "$miniq_arg_output" '}'; printf '\n'; return 0 ;;
+    '{kind:"error",text:"read requires path"}')
+      printf '%s' '{"kind":"error","text":"read requires path"}'; printf '\n'; return 0 ;;
+    '{kind:"error",text:"shell requires command"}')
+      printf '%s' '{"kind":"error","text":"shell requires command"}'; printf '\n'; return 0 ;;
+    '{role:"tool",tool_call_id:$id,name:$name,content:$text}')
+      [[ ${miniq_arg_id+set} ]] || return 1
+      [[ ${miniq_arg_name+set} ]] || return 1
+      [[ ${miniq_arg_text+set} ]] || return 1
+      printf '%s' '{"role":"tool","tool_call_id":' "$miniq_arg_id" ',"name":' "$miniq_arg_name" ',"content":' "$miniq_arg_text" '}'; printf '\n'; return 0 ;;
+    '{type:"tool_result",tool_use_id:$id,content:$text}')
+      [[ ${miniq_arg_id+set} ]] || return 1
+      [[ ${miniq_arg_text+set} ]] || return 1
+      printf '%s' '{"type":"tool_result","tool_use_id":' "$miniq_arg_id" ',"content":' "$miniq_arg_text" '}'; printf '\n'; return 0 ;;
+    '{provider:$provider,model:$model,fallback_model:$fallback_model,reasoning:$reasoning,answer:$answer}')
+      [[ ${miniq_arg_provider+set} ]] || return 1
+      [[ ${miniq_arg_model+set} ]] || return 1
+      [[ ${miniq_arg_fallback_model+set} ]] || return 1
+      [[ ${miniq_arg_reasoning+set} ]] || return 1
+      [[ ${miniq_arg_answer+set} ]] || return 1
+      printf '%s' '{"provider":' "$miniq_arg_provider" ',"model":' "$miniq_arg_model" ',"fallback_model":' "$miniq_arg_fallback_model" ',"reasoning":' "$miniq_arg_reasoning" ',"answer":' "$miniq_arg_answer" '}'; printf '\n'; return 0 ;;
+  esac
+  return 1
+}
+miniagent_jq() {
+  local LC_ALL=C
+  export LC_ALL
+  local arg
+  case ${1-} in -cn|-nc) miniq_construct "$@" && return 0 ;; esac
+  for arg in "$@"; do
+    if [[ ${#arg} -ge 65536 ]]; then
+      # Linux limits individual exec arguments to ~128 KiB. Large histories and
+      # image attachments can exceed that, so pass a length-prefixed argument
+      # stream through a descriptor. Byte lengths are measured in the C locale.
+      miniq_awk --miniq-args-file <(for arg in "$@"; do printf '%s\n%s' "${#arg}" "$arg"; done)
+      return $?
+    fi
+  done
+  miniq_awk "$@"
+}
+miniq_awk() {
+  awk -- '
+# Minimal jq evaluator for the filters in miniagent.sh. MIT license.
+# JSON values and syntax nodes use integer handles. Unchanged values are shared.
+function die(msg) { print "miniq: " msg > "/dev/stderr"; exit EC }
+function bad(msg) { if (optional) { failed=1; return 0 } die(msg) }
+function value(t,v, n) { n=++NV; T[n]=t; V[n]=v; return n }
+function arr() { return value("array","") }
+function push(a,v) { A[a,++L[a]]=v }
+function put(a,k,v, i) {
+  if (!((a,k) in O)) { i=++L[a]; K[a,i]=k; O[a,k]=i }
+  A[a,O[a,k]]=v; delete Cache[a]
+}
+function get(a,k) { return ((a,k) in O) ? A[a,O[a,k]] : Null }
+function one(v, a) { a=arr(); push(a,v); return a }
+function append(a,b, i) { for(i=1;i<=L[b];i++)push(a,A[b,i]);return a }
+function truth(v) { return T[v]!="null" && !(T[v]=="boolean" && !V[v]) }
+function hex(s, i,n,c) { n=0;for(i=1;i<=length(s);i++){c=index("0123456789abcdef",tolower(substr(s,i,1)))-1;if(c<0)die("invalid Unicode escape");n=n*16+c}return n }
+function utf8(n) {
+  if(n==0)die("NUL characters are unsupported")
+  if(n<128)return sprintf("%c",n)
+  if(n<2048)return sprintf("%c%c",192+int(n/64),128+n%64)
+  if(n<65536)return sprintf("%c%c%c",224+int(n/4096),128+int(n/64)%64,128+n%64)
+  return sprintf("%c%c%c%c",240+int(n/262144),128+int(n/4096)%64,128+int(n/64)%64,128+n%64)
+}
+function unquote(s, out,i,c,h,low) {
+  s=substr(s,2,length(s)-2);out=""
+  while((i=index(s,"\\"))){out=out substr(s,1,i-1);c=substr(s,i+1,1);s=substr(s,i+2)
+    if(c=="u") {h=hex(substr(s,1,4));s=substr(s,5)
+      if(h>=55296&&h<=56319){if(substr(s,1,2)!="\\u")die("unpaired high surrogate");low=hex(substr(s,3,4));if(low<56320||low>57343)die("invalid low surrogate");s=substr(s,7);h=65536+(h-55296)*1024+low-56320}
+      else if(h>=56320&&h<=57343)die("unpaired low surrogate")
+      out=out utf8(h)
+    } else if(c=="n")out=out "\n";else if(c=="r")out=out "\r";else if(c=="t")out=out "\t";else if(c=="b")out=out sprintf("%c",8);else if(c=="f")out=out sprintf("%c",12);else if(c=="\\"||c=="/"||c=="\"")out=out c;else die("invalid string escape")
+  }return out s
+}
+function quote(s, i,c,rep) {
+  if(s!~/["\\\001-\037]/)return "\"" s "\""
+  gsub(/\\/,"\\\\",s);gsub(/"/,"\\\"",s)
+  gsub(/\n/,"\\n",s);gsub(/\r/,"\\r",s);gsub(/\t/,"\\t",s)
+  if(s~/[\001-\037]/)for(i=1;i<32;i++)if(i!=9&&i!=10&&i!=13){c=sprintf("%c",i);rep=(i==8?"\\b":i==12?"\\f":sprintf("\\u%04x",i));gsub(c,rep,s)}
+  return "\"" s "\""
+}
+function spaces(n, s) { s="";while(n-->0)s=s " ";return s }
+function render(v,pretty,level, out,i,k,sep) {
+  if(!pretty && v in Cache)return Cache[v]
+  if(T[v]=="null")return "null"
+  if(T[v]=="boolean")return V[v]?"true":"false"
+  if(T[v]=="number")return V[v]
+  if(T[v]=="string") {out=quote(V[v]);if(!pretty)Cache[v]=out;return out}
+  out=(T[v]=="array"?"[":"{");sep=""
+  for(i=1;i<=L[v];i++){
+    out=out sep (pretty?"\n" spaces(level+2):"")
+    if(T[v]=="object")out=out quote(K[v,i]) (pretty?": ":":")
+    out=out render(A[v,i],pretty,level+2);sep=","
+  }
+  out=out (pretty&&L[v]?"\n" spaces(level):"") (T[v]=="array"?"]":"}")
+  if(!pretty)Cache[v]=out;return out
+}
+function number(n) { return value("number",sprintf("%.17g",n)) }
+function jspace( c) {while((c=substr(JS,JP,1))!="" && c~/[ \t\r\n]/)JP++}
+function jparse( c,n,k,start,tail,raw) {
+  if(++JD>512)die("JSON nesting limit exceeded")
+  jspace();c=substr(JS,JP,1)
+  if(c=="\"") {
+    tail=substr(JS,JP)
+    if(!match(tail,/^"[^"\\]*"/) && !match(tail,/^"([^"\\]|\\["\\\/bfnrt]|\\u[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F])*"/))die("invalid JSON string")
+    raw=substr(tail,1,RLENGTH);JP+=RLENGTH
+    if(raw~/[\001-\037]/)die("unescaped control character")
+    n=value("string",unquote(raw))
+  } else if(c=="["||c=="{") {
+    JP++;n=value(c=="["?"array":"object","");jspace()
+    if(substr(JS,JP,1)==(c=="["?"]":"}"))JP++
+    else while(1){
+      if(c=="{"){k=jparse();if(T[k]!="string")die("object key must be a string");jspace();if(substr(JS,JP++,1)!=":")die("expected colon");put(n,V[k],jparse())}
+      else push(n,jparse())
+      jspace();k=substr(JS,JP++,1);if(k==(c=="["?"]":"}"))break;if(k!=",")die("expected comma or closing bracket")
+    }
+  } else {
+    tail=substr(JS,JP)
+    if(match(tail,/^-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?/)){raw=substr(tail,1,RLENGTH);JP+=RLENGTH;n=value("number",raw)}
+    else if(substr(tail,1,4)=="null"){JP+=4;n=Null}
+    else if(substr(tail,1,4)=="true"){JP+=4;n=True}
+    else if(substr(tail,1,5)=="false"){JP+=5;n=False}
+    else die("invalid JSON at byte " JP)
+    if(JP<=length(JS) && substr(JS,JP,1)!~/[ \t\r\n,\]}]/)die("invalid JSON token at byte " JP)
+  }
+  JD--;return n
+}
+function parsejson(s,stream, n,a) {JS=s;JP=1;JD=0;if(stream)a=arr();jspace();while(JP<=length(JS)){n=jparse();if(!stream){jspace();if(JP<=length(JS))die("extra JSON input");return n}push(a,n);jspace()}if(!stream)die("empty JSON input");return a}
+# Source lexer / recursive descent parser. No eval or shell code generation.
+function lex(s, tail,t) {
+  NT=0
+  while(length(s)){
+    if(match(s,/^[ \t\r\n]+/)){s=substr(s,RLENGTH+1);continue}
+    if(substr(s,1,1)=="#"){sub(/^[^\n]*/,"",s);continue}
+    if(substr(s,1,1)=="\""){
+      if(!match(s,/^"([^"\\]|\\.)*"/))die("unterminated filter string")
+      t=substr(s,1,RLENGTH);s=substr(s,RLENGTH+1);Tok[++NT]="literal";Lit[NT]=value("string",unquote(t));continue
+    }
+    if(match(s,/^[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?/)){t=substr(s,1,RLENGTH);s=substr(s,RLENGTH+1);Tok[++NT]="literal";Lit[NT]=value("number",t);continue}
+    if(match(s,/^[$@]?[A-Za-z_][A-Za-z_0-9]*/)){Tok[++NT]=substr(s,1,RLENGTH);s=substr(s,RLENGTH+1);continue}
+    t=substr(s,1,2);if(t=="//"||t=="=="||t=="!="||t=="<="||t==">="||t=="+="){Tok[++NT]=t;s=substr(s,3)}else{Tok[++NT]=substr(s,1,1);s=substr(s,2)}
+  }Tok[++NT]="EOF";TP=1
+}
+function eat(t) {if(Tok[TP]!=t)return 0;TP++;return 1}
+function need(t) {if(!eat(t))die("expected " t ", got " Tok[TP])}
+function node(op,a,b,c,name, n) {n=++NN;Op[n]=op;C[n,1]=a;C[n,2]=b;C[n,3]=c;Name[n]=name;return n}
+function prec(t) {return t=="|"||t=="as"?1:t==","?2:t=="+="?3:t=="//"?4:t=="or"?5:t=="and"?6:t=="=="||t=="!="||t=="<"||t==">"||t=="<="||t==">="?7:t=="+"||t=="-"?8:t=="*"?9:0}
+function expr(min, n,op,pr,v,r) {
+  n=primary()
+  while(prec(Tok[TP])>=min){op=Tok[TP++];pr=prec(op)
+    if(op=="as"){v=Tok[TP++];if(substr(v,1,1)!="$")die("expected variable");need("|");r=expr(1);n=node("bind",n,r,0,v)}
+    else{r=expr(pr+(op=="//"?0:1));n=node(op,n,r)}
+  }return n
+}
+function conditional( cond,yes,no) {cond=expr(1);need("then");yes=expr(1);if(eat("elif"))no=conditional();else{need("else");no=expr(1);need("end")}return node("if",cond,yes,no)}
+function primary( n,name,k,b,e,i) {
+  if(++PD>512)die("filter nesting limit exceeded")
+  if(eat("def")){name=Tok[TP++];need(":");Defs[name]=expr(1);need(";");n=expr(1);PD--;return n}
+  if(eat("if")){n=conditional();PD--;return n}
+  if(eat("(")){n=expr(1);need(")")}
+  else if(eat("[")){n=node("array");if(!eat("]")){C[n,1]=expr(1);need("]")}}
+  else if(eat("{")){n=node("object");if(!eat("}")){i=0;do{k=(Tok[TP]=="literal"?V[Lit[TP]]:Tok[TP]);TP++;need(":");NK[n,++i]=k;C[n,i]=expr(3)}while(eat(","));need("}");NC[n]=i}}
+  else if(eat(".")){n=node("id");if(Tok[TP]~/^[A-Za-z_]/ && Tok[TP]!~/^(EOF|as|then|else|elif|end)$/ && !prec(Tok[TP]))n=node("field",n,0,0,Tok[TP++])}
+  else if(eat("-"))n=node("neg",primary())
+  else if(Tok[TP]=="literal"){n=node("lit",0,0,0,Lit[TP++])}
+  else {name=Tok[TP++];if(name=="null"||name=="true"||name=="false")n=node("lit",0,0,0,name=="null"?Null:name=="true"?True:False)
+    else if(substr(name,1,1)=="$")n=node("var",0,0,0,name)
+    else {
+      if(!(name in Defs) && index("|empty|not|type|length|tojson|tostring|tonumber|floor|ascii_upcase|first|last|to_entries|select|map|any|join|startswith|contains|has|test|", "|" name "|")==0)die("unsupported filter " name)
+      n=node("call",0,0,0,name);if(eat("(")){i=0;do{C[n,++i]=expr(1)}while(eat(";"));need(")");NC[n]=i}
+    }
+  }
+  while(1){
+    if(eat("."))n=node("field",n,0,0,Tok[TP++])
+    else if(eat("[")){if(eat("]"))n=node("each",n);else{b=0;e=0;if(Tok[TP]!=":")b=expr(1);if(eat(":")){if(Tok[TP]!="]")e=expr(1);n=node("slice",n,b,e)}else n=node("index",n,b);need("]")}}
+    else if(eat("?"))n=node("optional",n);else break
+  }PD--;return n
+}
+function envget(e,name) {while(e){if(EN[e]==name)return EV[e];e=EP[e]}if(name in Vars)return Vars[name];return bad("undefined variable " name)}
+function bind(e,name,v, n) {n=++NE;EP[n]=e;EN[n]=name;EV[n]=v;return n}
+function copy(v, n,i) {n=value(T[v],V[v]);for(i=1;i<=L[v];i++)if(T[v]=="object")put(n,K[v,i],A[v,i]);else push(n,A[v,i]);return n}
+function add(a,b, r,i) {
+  if(T[a]=="null")return b;if(T[b]=="null")return a
+  if(T[a]!=T[b])return bad("incompatible operands for +")
+  if(T[a]=="string")return value("string",V[a] V[b])
+  if(T[a]=="number")return number(V[a]+V[b])
+  if(T[a]=="array"){r=copy(a);append(r,b);return r}
+  if(T[a]=="object"){r=copy(a);for(i=1;i<=L[b];i++)put(r,K[b,i],A[b,i]);return r}
+  return bad("unsupported addition")
+}
+function equal(a,b, i,k) {
+  if(T[a]!=T[b])return 0
+  if(T[a]=="number")return (V[a]+0)==(V[b]+0)
+  if(T[a]!="array"&&T[a]!="object")return (V[a] "x")== (V[b] "x")
+  if(L[a]!=L[b])return 0
+  for(i=1;i<=L[a];i++){if(T[a]=="array"){if(!equal(A[a,i],A[b,i]))return 0}else{k=K[a,i];if(!((b,k) in O)||!equal(A[a,i],get(b,k)))return 0}}return 1
+}
+function compare(a,b, x,y) {if(T[a]=="number"&&T[b]=="number")return (V[a]+0)<(V[b]+0)?-1:(V[a]+0)>(V[b]+0)?1:0;x=V[a] "x";y=V[b] "x";return x<y?-1:x>y?1:0}
+function ulen(s) {gsub(/[\200-\277]/,"",s);return length(s)}
+function uslice(s,b,e, i,n,start,stop,c) {n=0;start=length(s)+1;stop=length(s)+1;for(i=1;i<=length(s);i++){c=substr(s,i,1);if(c!~/[\200-\277]/){if(n==b)start=i;if(n==e){stop=i;break}n++}}return substr(s,start,stop-start)}
+function boundary(n,input,e,len,fallback, r,i) {if(!n)return fallback;r=eval(n,input,e);if(L[r]!=1||T[A[r,1]]!="number")return bad("invalid slice bound");i=V[A[r,1]]+0;if(i<0)i+=len;return i<0?0:i>len?len:i}
+function update(root,path,rhs,input,e, op,base,r,ks,k,i,v) {
+  op=Op[path];if(op=="id")return add(root,rhs)
+  # Resolve a simple field/index chain, cloning only the containers on that path.
+  if(op!="field"&&op!="index")return bad("unsupported update path")
+  base=eval(C[path,1],root,e);if(L[base]!=1)return bad("ambiguous update path");v=A[base,1]
+  if(op=="field"){k=Name[path];r=copy(v);if(T[r]=="null")T[r]="object";if(T[r]!="object")return bad("invalid field update");put(r,k,add(get(r,k),rhs))}
+  else{ks=eval(C[path,2],input,e);if(L[ks]!=1||T[v]!="array")return bad("invalid array update");i=V[A[ks,1]]+0;if(i<0)i+=L[v];if(i<0||i>=L[v])return bad("update index out of bounds");r=copy(v);A[r,i+1]=add(A[r,i+1],rhs)}
+  return replace(root,C[path,1],r,input,e)
+}
+function replace(root,path,replacement,input,e, base,ks,k,i,r,v) {
+  if(Op[path]=="id")return replacement
+  base=eval(C[path,1],root,e);v=A[base,1];r=copy(v)
+  if(Op[path]=="field")put(r,Name[path],replacement)
+  else if(Op[path]=="index"){ks=eval(C[path,2],input,e);i=V[A[ks,1]]+0;if(i<0)i+=L[r];A[r,i+1]=replacement}
+  else return bad("unsupported assignment path")
+  return replace(root,C[path,1],r,input,e)
+}
+function eval(n,input,e, op,r,left,right,i,j,a,b,k,tmp,len,start,end,v,x,oldfailed) {
+  if(++ED>512)die("evaluation nesting limit exceeded")
+  op=Op[n];r=arr()
+  if(op=="lit")push(r,Name[n])
+  else if(op=="id")push(r,input)
+  else if(op=="var")push(r,envget(e,Name[n]))
+  else if(op=="|"){left=eval(C[n,1],input,e);for(i=1;i<=L[left];i++)append(r,eval(C[n,2],A[left,i],e))}
+  else if(op==","){append(r,eval(C[n,1],input,e));append(r,eval(C[n,2],input,e))}
+  else if(op=="bind"){left=eval(C[n,1],input,e);for(i=1;i<=L[left];i++)append(r,eval(C[n,2],input,bind(e,Name[n],A[left,i])))}
+  else if(op=="//"){left=eval(C[n,1],input,e);for(i=1;i<=L[left];i++)if(truth(A[left,i]))push(r,A[left,i]);if(!L[r])append(r,eval(C[n,2],input,e))}
+  else if(op=="optional"){oldfailed=failed;failed=0;optional++;tmp=eval(C[n,1],input,e);optional--;for(i=1;i<=L[tmp];i++)if(A[tmp,i])push(r,A[tmp,i]);failed=oldfailed}
+  else if(op=="if"){left=eval(C[n,1],input,e);for(i=1;i<=L[left];i++)append(r,eval(C[n,truth(A[left,i])?2:3],input,e))}
+  else if(op=="array"){a=arr();if(C[n,1])append(a,eval(C[n,1],input,e));push(r,a)}
+  else if(op=="object"){
+    push(r,value("object",""));for(i=1;i<=NC[n];i++){left=eval(C[n,i],input,e);tmp=arr();for(j=1;j<=L[r];j++)for(k=1;k<=L[left];k++){a=copy(A[r,j]);put(a,NK[n,i],A[left,k]);push(tmp,a)}r=tmp}
+  }
+  else if(op=="field"){left=eval(C[n,1],input,e);for(i=1;i<=L[left];i++){a=A[left,i];if(T[a]=="object"||T[a]=="null")push(r,get(a,Name[n]));else bad("cannot index " T[a] " with " Name[n])}}
+  else if(op=="each"){left=eval(C[n,1],input,e);for(i=1;i<=L[left];i++){a=A[left,i];if(T[a]!="array"&&T[a]!="object")bad("cannot iterate " T[a]);else for(j=1;j<=L[a];j++)push(r,A[a,j])}}
+  else if(op=="index"){
+    left=eval(C[n,1],input,e);right=eval(C[n,2],input,e);for(i=1;i<=L[left];i++)for(j=1;j<=L[right];j++){a=A[left,i];b=A[right,j]
+      if(T[a]=="null")push(r,Null);else if(T[a]=="object"&&T[b]=="string")push(r,get(a,V[b]));else if(T[a]=="array"&&T[b]=="number"){k=V[b]+0;if(k<0)k+=L[a];push(r,k<0||k>=L[a]?Null:A[a,k+1])}else bad("invalid index")
+    }
+  }
+  else if(op=="slice"){
+    left=eval(C[n,1],input,e);for(i=1;i<=L[left];i++){a=A[left,i];if(T[a]=="null"){push(r,Null);continue}if(T[a]!="string"&&T[a]!="array"){bad("invalid slice");continue}
+      len=T[a]=="array"?L[a]:ulen(V[a]);start=boundary(C[n,2],input,e,len,0);end=boundary(C[n,3],input,e,len,len);if(end<start)end=start
+      if(T[a]=="string")push(r,value("string",uslice(V[a],start,end)));else{b=arr();for(j=start+1;j<=end;j++)push(b,A[a,j]);push(r,b)}
+    }
+  }
+  else if(op=="+="){right=eval(C[n,2],input,e);for(i=1;i<=L[right];i++)push(r,update(input,C[n,1],A[right,i],input,e))}
+  else if(op=="neg"){left=eval(C[n,1],input,e);for(i=1;i<=L[left];i++){if(T[A[left,i]]!="number")bad("invalid negation");else push(r,number(-V[A[left,i]]))}}
+  else if(op=="call")r=call(n,input,e)
+  else {
+    left=eval(C[n,1],input,e)
+    for(i=1;i<=L[left];i++){a=A[left,i]
+      if(op=="and"&&!truth(a)){push(r,False);continue}if(op=="or"&&truth(a)){push(r,True);continue}
+      right=eval(C[n,2],input,e)
+      for(j=1;j<=L[right];j++){b=A[right,j]
+        if(op=="+")push(r,add(a,b))
+        else if(op=="-"||op=="*"){if(T[a]!="number"||T[b]!="number")bad("invalid arithmetic");else push(r,number(op=="-"?V[a]-V[b]:V[a]*V[b]))}
+        else {if(op=="=="||op=="!="){x=equal(a,b);if(op=="!=")x=!x}
+          else if(op=="and"||op=="or")x=truth(b)
+          else{v=compare(a,b);if(op=="<")x=v<0;else if(op==">")x=v>0;else if(op=="<=")x=v<=0;else if(op==">=")x=v>=0;else bad("unsupported operator " op)}
+          push(r,x?True:False)
+        }
+      }
+    }
+  }
+  ED--;return r
+}
+function contains(a,b, i,j,found,k) {
+  if(T[a]=="string"&&T[b]=="string")return index(V[a],V[b])>0
+  if(T[a]=="array"&&T[b]=="array"){for(i=1;i<=L[b];i++){found=0;for(j=1;j<=L[a];j++)if(contains(A[a,j],A[b,i])){found=1;break}if(!found)return 0}return 1}
+  if(T[a]=="object"&&T[b]=="object"){for(i=1;i<=L[b];i++){k=K[b,i];if(!((a,k) in O)||!contains(get(a,k),A[b,i]))return 0}return 1}return equal(a,b)
+}
+function call(n,input,e, name,r,args,a,b,i,j,s,sep,tmp,x,pat,flags) {
+  name=Name[n];r=arr()
+  if(name in Defs)return eval(Defs[name],input,e)
+  if(name=="empty")return r
+  if(name=="not")return one(truth(input)?False:True)
+  if(name=="type")return one(value("string",T[input]))
+  if(name=="length"){if(T[input]=="null")x=0;else if(T[input]=="string")x=ulen(V[input]);else if(T[input]=="array"||T[input]=="object")x=L[input];else if(T[input]=="number")x=V[input]<0?-V[input]:V[input];else return bad("invalid length");return one(number(x))}
+  if(name=="tojson")return one(value("string",render(input,0,0)))
+  if(name=="tostring")return one(T[input]=="string"?input:value("string",render(input,0,0)))
+  if(name=="tonumber"){if(T[input]=="number")return one(input);if(T[input]=="string"&&V[input]~/^-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?$/)return one(number(V[input]+0));return bad("invalid tonumber")}
+  if(name=="floor"){if(T[input]!="number")return bad("invalid floor");x=int(V[input]);if(x>V[input])x--;return one(number(x))}
+  if(name=="ascii_upcase"){if(T[input]!="string")return bad("invalid ascii_upcase");return one(value("string",toupper(V[input])))}
+  if(name=="first"||name=="last"){if(T[input]!="array")return bad("invalid first/last");return one(!L[input]?Null:A[input,name=="first"?1:L[input]])}
+  if(name=="to_entries"){if(T[input]!="array"&&T[input]!="object")return bad("invalid to_entries");a=arr();for(i=1;i<=L[input];i++){b=value("object","");put(b,"key",T[input]=="array"?number(i-1):value("string",K[input,i]));put(b,"value",A[input,i]);push(a,b)}return one(a)}
+  if(name=="select"){args=eval(C[n,1],input,e);for(i=1;i<=L[args];i++)if(truth(A[args,i]))push(r,input);return r}
+  if(name=="map"){if(T[input]!="array"&&T[input]!="object")return bad("invalid map");a=arr();for(i=1;i<=L[input];i++)append(a,eval(C[n,1],A[input,i],e));return one(a)}
+  if(name=="any"){args=eval(C[n,1],input,e);for(i=1;i<=L[args];i++){tmp=eval(C[n,2],A[args,i],e);for(j=1;j<=L[tmp];j++)if(truth(A[tmp,j]))return one(True)}return one(False)}
+  if(name=="join"){if(T[input]!="array")return bad("invalid join");args=eval(C[n,1],input,e);for(i=1;i<=L[args];i++){s="";sep="";for(j=1;j<=L[input];j++){a=A[input,j];if(T[a]=="array"||T[a]=="object")return bad("join of container");s=s sep (T[a]=="string"?V[a]:T[a]=="null"?"":render(a,0,0));sep=V[A[args,i]]}push(r,value("string",s))}return r}
+  if(name=="startswith"||name=="contains"||name=="has"){args=eval(C[n,1],input,e);for(i=1;i<=L[args];i++){a=A[args,i];if(name=="contains")x=contains(input,a);else if(name=="startswith"){if(T[input]!="string"||T[a]!="string")return bad("invalid startswith");x=index(V[input],V[a])==1}else if(T[input]=="object")x=((input,V[a]) in O);else if(T[input]=="array")x=V[a]>=0&&V[a]<L[input];else x=0;push(r,x?True:False)}return r}
+  if(name=="test"){if(T[input]!="string")return bad("test requires string");args=eval(C[n,1],input,e);flags="";if(C[n,2]){tmp=eval(C[n,2],input,e);flags=V[A[tmp,1]];if(flags!=""&&flags!="i")return bad("only regex flag i supported")}
+    for(i=1;i<=L[args];i++){pat=V[A[args,i]];s=V[input];if(flags=="i"){pat=tolower(pat);s=tolower(s)}push(r,s~pat?True:False)}return r
+  }
+  return bad("unsupported filter " name)
+}
+# An anchored empty-record regex reads a whole nonempty file, preserving newlines.
+# Do not close /dev/stdin: mawk aliases it to its own standard input stream.
+function readexact(path, s,line,status,old) {old=RS;RS="^$";s="";while((status=(getline line < path))>0){if(length(s))die("NUL bytes in raw input are unsupported");s=line}if(status<0)die("cannot read " path);if(path!="/dev/stdin")close(path);RS=old;return s}
+BEGIN {
+  EC=2
+  if(ARGV[1]=="--miniq-args-file") {
+    packed=readexact(ARGV[2]);for(ai=1;ai<ARGC;ai++)delete ARGV[ai];ARGC=1
+    while(length(packed)) {
+      sep=index(packed,"\n");if(!sep)die("invalid argument framing")
+      size=substr(packed,1,sep-1);if(size!~/^[0-9]+$/)die("invalid argument length");size+=0
+      packed=substr(packed,sep+1);if(size>length(packed))die("truncated argument")
+      ARGV[ARGC++]=substr(packed,1,size);packed=substr(packed,size+1)
+    }
+  }
+  Null=value("null","");True=value("boolean",1);False=value("boolean",0);options=1;havefilter=0
+  for(ai=1;ai<ARGC;ai++){
+    arg=ARGV[ai]
+    if(options&&arg=="--"){options=0;continue}
+    if(options&&arg=="--version"){print "miniq-0.1 (Bash/awk miniagent subset)";exit 0}
+    if(options&&(arg=="--arg"||arg=="--argjson"||arg=="--rawfile"||arg=="--slurpfile")){
+      if(ai+2>=ARGC)die(arg " requires name and value");vn="$" ARGV[++ai];av=ARGV[++ai]
+      if(arg=="--arg")Vars[vn]=value("string",av);else if(arg=="--argjson")Vars[vn]=parsejson(av,0);else if(arg=="--rawfile")Vars[vn]=value("string",readexact(av));else Vars[vn]=parsejson(readexact(av),1);continue
+    }
+    if(options&&substr(arg,1,1)=="-"&&arg!="-"){
+      if(arg=="--null-input")arg="-n";else if(arg=="--compact-output")arg="-c";else if(arg=="--raw-output")arg="-r";else if(arg=="--raw-input")arg="-R";else if(arg=="--slurp")arg="-s";else if(arg=="--exit-status")arg="-e"
+      for(ak=2;ak<=length(arg);ak++){ch=substr(arg,ak,1);if(ch=="n")nullin=1;else if(ch=="c")compact=1;else if(ch=="r")rawout=1;else if(ch=="R")rawin=1;else if(ch=="s")slurp=1;else if(ch=="e")exitstatus=1;else if(ch!="M")die("unsupported option " arg)}continue
+    }
+    if(!havefilter){filter=arg;havefilter=1}else Files[++NFIL]=arg
+  }
+  if(!havefilter)filter="."
+  EC=3;lex(filter);AST=expr(1);need("EOF")
+  EC=5;Inputs=arr()
+  if(nullin)push(Inputs,Null)
+  else {
+    if(!NFIL)Files[++NFIL]="-"
+    rawbuf=""
+    for(fi=1;fi<=NFIL;fi++){
+      data=readexact(Files[fi]=="-"?"/dev/stdin":Files[fi])
+      if(rawin){if(slurp)rawbuf=rawbuf data;else{while(index(data,"\n")){idx=index(data,"\n");push(Inputs,value("string",substr(data,1,idx-1)));data=substr(data,idx+1)}if(length(data))push(Inputs,value("string",data))}}
+      else append(Inputs,parsejson(data,1))
+    }
+    if(rawin&&slurp)Inputs=one(value("string",rawbuf));else if(slurp)Inputs=one(Inputs)
+  }
+  EC=5;status=4
+  for(ii=1;ii<=L[Inputs];ii++){Result=eval(AST,A[Inputs,ii],0);for(ri=1;ri<=L[Result];ri++){v=A[Result,ri];if(rawout&&T[v]=="string")printf "%s\n",V[v];else printf "%s\n",render(v,!compact,0);status=truth(v)?0:1}}
+  exit exitstatus?status:0
+}
+  ' "$@"
+}
 
-  # A custom jq path is intentional configuration; installing the system jq
-  # would not repair it, so preserve the normal explicit error in that case.
-  if [[ "$JQ_BIN" != "jq" ]] && ! command -v "$JQ_BIN" >/dev/null 2>&1; then
-    return 0
-  fi
-
-  need_cmd "$CURL_BIN"
-  need_cmd bash
-  info "installing missing requirements: ${missing_commands[*]}"
-  if ! "$CURL_BIN" -fsSL "$INSTALL_URL" | bash -s -- --dependencies-only; then
-    die "could not install required commands: ${missing_commands[*]}"
-  fi
-  if [[ "$JQ_BIN" == "jq" ]] && ! command -v jq >/dev/null 2>&1 && [[ -x "$DEPENDENCY_DIR/jq" ]]; then
-    JQ_BIN="$DEPENDENCY_DIR/jq"
+select_json_processor() {
+  # Preserve explicit custom paths, including their normal missing-command error.
+  if [[ "$JQ_BIN" == "jq" ]] && ! command -v jq >/dev/null 2>&1; then
+    JQ_BIN=miniagent_jq
   fi
 }
 is_uint() { [[ "$1" =~ ^[1-9][0-9]*$ ]]; }
@@ -1356,7 +1778,7 @@ main() {
   DEBUG_ARGV=("$@")
   parse_args "$@"
   reattach_piped_script_input
-  bootstrap_dependencies
+  select_json_processor
   need_cmd "$CURL_BIN"; need_cmd "$JQ_BIN"; need_cmd base64; need_cmd awk
   if [[ -t 0 && ( "$INTERACTIVE" -eq 1 || -z "$PROMPT" ) ]]; then need_cmd stty; fi
   init_debug

@@ -401,12 +401,56 @@ assert_equal "$(cmp -s "$ROOT/miniagent.sh" "$TMP/install-bin/miniagent"; printf
 MINIAGENT_INSTALL_DIR="$TMP/dependencies-only-bin" \
   bash "$ROOT/install.sh" --dependencies-only >/dev/null 2>&1
 if [[ ! -e "$TMP/dependencies-only-bin/miniagent" ]]; then ok "Dependencies-only mode does not install the harness"; else not_ok "Dependencies-only mode does not install the harness"; fi
-MINIAGENT_DEPENDENCY_DIR="$TMP/local-dependencies" \
-  MINIAGENT_FORCE_LOCAL_JQ=1 \
-  MINIAGENT_JQ_URL="file://$ROOT/tests/fixtures/jq" \
-  bash "$ROOT/install.sh" --dependencies-only >/dev/null 2>&1
-if [[ -x "$TMP/local-dependencies/jq" ]]; then ok "Dependencies-only mode downloads jq locally"; else not_ok "Dependencies-only mode downloads jq locally"; fi
-assert_contains "$("$TMP/local-dependencies/jq" --version)" "jq-" "Downloaded jq is executable"
+# A restricted PATH models a machine without jq. Mock-provider JSON generation
+# still uses the real jq by absolute path; only the harness lacks it.
+real_jq=$(command -v jq)
+no_jq_path="$TMP/no-jq-bin"
+mkdir -p "$no_jq_path"
+for command_name in bash curl awk base64 cat chmod cmp cp date dd env find head mkdir mktemp mv rm sort stty tail tr uname wc sed nl; do
+  ln -s "$(command -v "$command_name")" "$no_jq_path/$command_name"
+done
+{
+  printf '%s\n' '#!/usr/bin/env bash'
+  printf 'jq() { %q "$@"; }\n' "$real_jq"
+  tail -n +2 "$TMP/curl"
+} > "$TMP/curl-with-real-jq"
+chmod +x "$TMP/curl-with-real-jq"
+
+processor=$(JQ_BIN=jq bash -c 'source "$1"; select_json_processor; printf "%s" "$JQ_BIN"' _ "$ROOT/miniagent.sh")
+assert_equal "$processor" "jq" "Native jq is preferred when available"
+processor=$(PATH="$no_jq_path" JQ_BIN=jq bash -c 'source "$1"; select_json_processor; printf "%s" "$JQ_BIN"' _ "$ROOT/miniagent.sh")
+assert_equal "$processor" "miniagent_jq" "Missing jq selects the embedded fallback"
+
+for provider in openai anthropic openrouter; do
+  out=$(PATH="$no_jq_path" JQ_BIN=jq OPENAI_API_KEY=test ANTHROPIC_API_KEY=test OPENROUTER_API_KEY=test \
+    CURL_BIN="$TMP/curl-with-real-jq" "$ROOT/miniagent.sh" -q -p "$provider" -C "$TMP" "inspect")
+  if [[ "$provider" == anthropic ]]; then expected="anthropic done"; else expected="openai done"; fi
+  assert_contains "$out" "$expected" "$provider completes a tool loop without jq"
+done
+out=$(PATH="$no_jq_path" JQ_BIN=jq OPENAI_API_KEY=test CURL_BIN="$TMP/curl-with-real-jq" \
+  bash -s -- -q -C "$TMP" "inspect" < "$ROOT/miniagent.sh")
+assert_contains "$out" "openai done" "Piped script runs without jq or companion files"
+
+if PATH="$no_jq_path" JQ_BIN="$TMP/missing-custom-jq" OPENAI_API_KEY=test CURL_BIN="$TMP/curl-with-real-jq" \
+  "$ROOT/miniagent.sh" -q "inspect" > "$TMP/missing-jq.stdout" 2> "$TMP/missing-jq.stderr"; then
+  not_ok "Missing custom JQ_BIN remains an error"
+else
+  assert_contains "$(cat "$TMP/missing-jq.stderr")" "required command not found: $TMP/missing-custom-jq" "Missing custom JQ_BIN remains an error"
+fi
+
+if PATH="$no_jq_path" MINIAGENT_INSTALL_DIR="$TMP/no-jq-dependencies" \
+  bash "$ROOT/install.sh" --dependencies-only > "$TMP/no-jq-install.stdout" 2> "$TMP/no-jq-install.stderr"; then
+  ok "Dependency checks succeed without jq"
+else
+  not_ok "Dependency checks succeed without jq"
+fi
+if [[ ! -e "$TMP/no-jq-dependencies" ]]; then ok "Dependency checks do not download or create files"; else not_ok "Dependency checks do not download or create files"; fi
+PATH="$no_jq_path" MINIAGENT_SCRIPT_URL="file://$ROOT/miniagent.sh" MINIAGENT_INSTALL_DIR="$TMP/no-jq-install" \
+  bash "$ROOT/install.sh" >/dev/null 2>&1
+assert_equal "$(find "$TMP/no-jq-install" -type f | wc -l | tr -d ' ')" "1" "Installer only downloads miniagent without jq"
+out=$(PATH="$no_jq_path" JQ_BIN=jq OPENAI_API_KEY=test CURL_BIN="$TMP/curl-with-real-jq" \
+  "$TMP/no-jq-install/miniagent" -q -C "$TMP" "inspect")
+assert_contains "$out" "openai done" "Installed script uses its embedded fallback"
 
 source "$ROOT/miniagent.sh"
 assert_equal "$MAX_TURNS" "1024" "Default maximum turns"
